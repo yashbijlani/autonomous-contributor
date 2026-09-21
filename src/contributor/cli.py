@@ -1,0 +1,321 @@
+"""CLI: issue/discover/run/status/logs/resume/cancel/config/autonomous."""
+from __future__ import annotations
+
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from contributor.config import get_settings
+from contributor.discovery.github_search import DiscoveryFilters
+from contributor.discovery.github_search import discover as discover_issues
+from contributor.github.client import GitHubClient
+from contributor.graph.nodes import WorkflowContext
+from contributor.graph.workflow import run_to_completion
+from contributor.models.state import IssueRef, JobState, JobStatus
+from contributor.observability.logging import setup_logging
+from contributor.opencode.runner import OpenCodeRunner
+from contributor.persistence.database import Database, new_job_id
+from contributor.persistence.repositories import JobRepository
+from contributor.sandbox.manager import SandboxManager
+
+app = typer.Typer(no_args_is_help=True, add_completion=False)
+console = Console()
+
+
+def make_context() -> WorkflowContext:
+    settings = get_settings()
+    setup_logging(settings.log_level, settings.log_json)
+    db = Database(settings.database_url)
+    github = GitHubClient(token=settings.github_token, api_base=settings.github_api_base, timeout=settings.github_timeout_s)
+    sandbox = SandboxManager(settings)
+    runner = OpenCodeRunner(settings)
+    return WorkflowContext(settings=settings, db=db, github=github, sandbox=sandbox, runner=runner)
+
+
+def _create_job(ctx: WorkflowContext, ref: IssueRef) -> JobState:
+    job = JobState(job_id=new_job_id(), repository=ref.full_name, issue_number=ref.number)
+    job.add_event("JOB_CREATED", f"Created for {ref.short}")
+    ctx.repo.save_incremental(job)
+    return job
+
+
+def _preflight_gate(ctx: WorkflowContext, job: JobState) -> bool:
+    """Preflight every tier BEFORE cloning. Proceed if any model is usable;
+    otherwise mark BLOCKED_PROVIDER. Unavailable models are recorded."""
+    from contributor.models.state import JobStatus
+    from contributor.observability import events
+    from contributor.observability.events import emit
+    from contributor.opencode.preflight import any_usable, run_all_preflights
+
+    job.current_state = JobStatus.PREPARE_WORKSPACE
+    emit(job, events.PREFLIGHT_STARTED, "OpenCode preflight (all tiers)", agent="preflight")
+    results = run_all_preflights(ctx.settings, ctx.runner, health_store=ctx.health)
+    usable = [t for t, r in results.items() if r.ok]
+    unavailable = {t: r.error_kind for t, r in results.items() if not r.ok}
+    if any_usable(results):
+        emit(job, events.PREFLIGHT_PASSED, f"usable tiers: {', '.join(usable)}", agent="preflight",
+             data={"usable": usable, "unavailable": unavailable})
+        ctx.repo.save_incremental(job)
+        return True
+    detail = "; ".join(f"{t}:{r.error_kind or r.detail[:60]}" for t, r in results.items())
+    job.current_state = JobStatus.BLOCKED_PROVIDER
+    job.escalated = True
+    job.human_escalation_reason = f"No usable OpenCode model. {detail}"
+    job.errors.append(job.human_escalation_reason)
+    emit(job, events.PREFLIGHT_FAILED, job.human_escalation_reason, agent="preflight")
+    job.done = True
+    ctx.repo.save_incremental(job)
+    console.print(f"[red]BLOCKED_PROVIDER: {job.human_escalation_reason}[/red]")
+    return False
+
+
+@app.command()
+def issue(ref: str, dry_run: bool = typer.Option(False, help="Only fetch + triage, do not implement")):
+    """Fetch an issue, triage it, and (by default) run the full workflow."""
+    ctx = make_context()
+    issue_ref = IssueRef.parse(ref)
+    job = _create_job(ctx, issue_ref)
+    console.print(f"[bold]Job {job.job_id}[/bold] for {issue_ref.short}")
+    if dry_run:
+        from contributor.github.issues import normalize_issue
+        from contributor.agents.triage import triage_issue
+
+        data = ctx.github.get_issue(issue_ref.owner, issue_ref.repo, issue_ref.number)
+        title, body, meta = normalize_issue(data)
+        tr = triage_issue(title, body, labels=meta.get("labels", []))
+        console.print(tr.model_dump_json(indent=2))
+        return
+    if not _preflight_gate(ctx, job):
+        raise typer.Exit(2)
+    final = run_to_completion(ctx, job)
+    console.print(f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'} escalated={final.escalated}")
+
+
+@app.command()
+def run(ref: str):
+    """Run the full autonomous workflow for OWNER/REPO#123."""
+    ctx = make_context()
+    issue_ref = IssueRef.parse(ref)
+    job = _create_job(ctx, issue_ref)
+    console.print(f"[bold]Job {job.job_id}[/bold] for {issue_ref.short}")
+    if not _preflight_gate(ctx, job):
+        raise typer.Exit(2)
+    final = run_to_completion(ctx, job)
+    console.print(f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'} escalated={final.escalated}")
+
+
+@app.command()
+def discover(
+    language: str = typer.Option("", help="Filter by language"),
+    label: list[str] = typer.Option([], help="Repeatable label filter"),
+    repo: str = typer.Option("", help="Restrict to OWNER/REPO"),
+    min_stars: int = typer.Option(0),
+    keyword: str = typer.Option(""),
+    unassigned: bool = typer.Option(False, "--unassigned", help="Only unassigned issues"),
+    max_difficulty: int = typer.Option(5, "--max-difficulty", help="Advisory difficulty ceiling"),
+    max_age: int = typer.Option(0, "--max-age", help="Only issues newer than N days (0=any)"),
+    max_results: int = typer.Option(20),
+):
+    """Search GitHub for candidate issues (read-only, never modifies repos)."""
+    ctx = make_context()
+    f = DiscoveryFilters(language=language, label=list(label), repo=repo, min_stars=min_stars,
+                         keyword=keyword, unassigned_only=unassigned, per_page=max_results,
+                         max_difficulty=max_difficulty, max_age_days=max_age)
+    items = discover_issues(ctx.github, f)
+    t = Table(title=f"Candidates ({len(items)})")
+    t.add_column("Issue"); t.add_column("Title"); t.add_column("Labels")
+    for it in items:
+        repo_url = (it.get("repository_url") or "")
+        rn = repo_url.split("/repos/")[-1] if "/repos/" in repo_url else "?"
+        t.add_row(f"{rn}#{it.get('number')}", str(it.get("title", ""))[:70],
+                  ",".join(l.get("name", "") for l in it.get("labels", [])))
+    console.print(t)
+
+
+@app.command()
+def status(job_id: str):
+    ctx = make_context()
+    st = ctx.repo.get(job_id)
+    if not st:
+        console.print(f"[red]Job {job_id} not found[/red]")
+        raise typer.Exit(1)
+    console.print(f"job={st.job_id} repo={st.repository}#{st.issue_number} state={st.current_state.value} "
+                  f"impl={st.implementation_attempt} debug={st.debug_attempt} review={st.review_attempt} "
+                  f"pr={st.pull_request_url or '-'} escalated={st.escalated} done={st.done}")
+    if st.human_escalation_reason:
+        console.print(f"[yellow]escalation: {st.human_escalation_reason}[/yellow]")
+    if st.errors:
+        console.print("[red]errors:[/red]")
+        for e in st.errors[-5:]:
+            console.print(f" - {e[:300]}")
+
+
+@app.command()
+def logs(job_id: str, limit: int = typer.Option(50)):
+    ctx = make_context()
+    evs = ctx.repo.events(job_id)
+    if not evs:
+        st = ctx.repo.get(job_id)
+        evs = st.event_history if st else []
+    for e in evs[-limit:]:
+        console.print(f"{e.at} {e.type} agent={e.agent or '-'} attempt={e.attempt} {e.message[:200]}")
+
+
+@app.command()
+def resume(job_id: str):
+    """Resume a job after crash/restart from persisted state."""
+    ctx = make_context()
+    st = ctx.repo.get(job_id)
+    if not st:
+        console.print(f"[red]Job {job_id} not found[/red]")
+        raise typer.Exit(1)
+    if st.done:
+        console.print(f"Job already done: {st.current_state.value}")
+        return
+    console.print(f"Resuming job {job_id} from {st.current_state.value}")
+    final = run_to_completion(ctx, st)
+    console.print(f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'}")
+
+
+@app.command()
+def cancel(job_id: str):
+    ctx = make_context()
+    st = ctx.repo.get(job_id)
+    if not st:
+        console.print(f"[red]Job {job_id} not found[/red]")
+        raise typer.Exit(1)
+    st.current_state = JobStatus.CANCELLED
+    st.done = True
+    st.add_event("JOB_FAILED", "Cancelled by operator")
+    ctx.repo.save_incremental(st)
+    try:
+        ctx.runner.cancel()
+    except Exception:
+        pass
+    console.print(f"Cancelled {job_id}")
+
+
+@app.command()
+def config():
+    s = get_settings()
+    console.print(s.model_dump_json(indent=2))
+
+
+@app.command()
+def usage(job_id: str = typer.Option("", "--job", help="Limit to one job")):
+    """Show model usage accounting (tier, model, duration, outcome)."""
+    import json as _json
+
+    from contributor.persistence.usage import list_usage, summarize_usage
+
+    ctx = make_context()
+    rows = list_usage(ctx.db, job_id or None)
+    t = Table(title=f"Model usage ({len(rows)} calls)")
+    for col in ("job", "task", "tier", "model", "variant", "seconds", "outcome"):
+        t.add_column(col)
+    for r in rows[:100]:
+        t.add_row(r.get("job_id", "")[:10], r.get("task", ""), r.get("tier", ""),
+                  r.get("model", ""), r.get("variant", "") or "-",
+                  f"{r.get('duration_s', 0):.1f}", r.get("outcome", ""))
+    console.print(t)
+    console.print(_json.dumps(summarize_usage(ctx.db)))
+
+
+@app.command()
+def doctor(
+    json_output: bool = typer.Option(False, "--json", help="Machine-readable JSON output"),
+    no_probe: bool = typer.Option(False, "--no-probe", help="Skip live inference probe"),
+):
+    """Diagnose the OpenCode integration (binary, auth, models, network, sandbox)."""
+    import json as _json
+
+    from contributor.opencode.doctor import run_doctor
+
+    ctx = make_context()
+    rep = run_doctor(ctx.settings, probe_inference_enabled=not no_probe, health_store=ctx.health)
+    if json_output:
+        console.print(_json.dumps({
+            "ok": rep.ok,
+            "sections": rep.sections,
+            "flags": rep.flags,
+            "usable_models": rep.usable_models,
+            "unavailable_models": rep.unavailable_models,
+            "warnings": rep.warnings,
+        }, indent=2))
+    else:
+        for section, items in rep.sections.items():
+            console.print(f"[bold]{section}[/bold]")
+            for name, status in items.items():
+                mark = "[green]OK[/green]" if rep.is_ok(section, name) else "[red]FAIL[/red]"
+                console.print(f"  {mark} {name}: {status[:160]}")
+        console.print("[green]doctor: healthy[/green]" if rep.ok else "[red]doctor: problems found[/red]")
+    if not rep.ok:
+        raise typer.Exit(1)
+
+
+@app.command()
+def autonomous(
+    language: str = typer.Option("", help="Discovery language filter"),
+    label: list[str] = typer.Option([]),
+    max_jobs: int = typer.Option(0, help="0 = run forever"),
+    once: bool = typer.Option(False, help="Single discovery pass"),
+):
+    """Continuously discover -> triage -> execute with concurrency cap."""
+    from contributor.opencode.preflight import any_usable, run_all_preflights
+
+    ctx = make_context()
+    settings = ctx.settings
+    results = run_all_preflights(settings, ctx.runner, health_store=ctx.health)
+    usable = [t for t, r in results.items() if r.ok]
+    if not any_usable(results):
+        detail = "; ".join(f"{t}:{r.error_kind or 'unavailable'}" for t, r in results.items())
+        console.print(f"[red]BLOCKED_PROVIDER, autonomous not started: {detail}[/red]")
+        raise typer.Exit(2)
+    console.print(f"[green]preflight OK, usable tiers: {', '.join(usable)}[/green]")
+    completed = 0
+    with ThreadPoolExecutor(max_workers=settings.max_concurrent_jobs) as pool:
+        while True:
+            f = DiscoveryFilters(language=language, label=list(label), per_page=10)
+            try:
+                items = discover_issues(ctx.github, f)
+            except Exception as e:
+                console.print(f"[red]discovery failed: {e}[/red]")
+                items = []
+            futures = []
+            for it in items:
+                try:
+                    num = int(it.get("number", 0))
+                    repo_url = it.get("repository_url", "")
+                    full = repo_url.split("/repos/")[-1] if "/repos/" in repo_url else ""
+                    if not full or not num:
+                        continue
+                    owner, repo = full.split("/", 1)
+                    ref = IssueRef(owner=owner, repo=repo, number=num)
+                    job = _create_job(ctx, ref)
+                    futures.append(pool.submit(run_to_completion, ctx, job))
+                    if max_jobs and completed + len(futures) >= max_jobs:
+                        break
+                except Exception as e:
+                    console.print(f"[red]queue failed: {e}[/red]")
+            for fut in futures:
+                try:
+                    final = fut.result(timeout=settings.job_timeout_s)
+                    console.print(f"job {final.job_id} -> {final.current_state.value}")
+                except Exception as e:
+                    console.print(f"[red]job failed: {e}[/red]")
+                completed += 1
+                if max_jobs and completed >= max_jobs:
+                    console.print("max_jobs reached")
+                    return
+            if once:
+                return
+            console.print(f"poll sleep {settings.autonomous_poll_interval_s}s ...")
+            time.sleep(settings.autonomous_poll_interval_s)
+
+
+if __name__ == "__main__":
+    app()
