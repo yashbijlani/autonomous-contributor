@@ -1162,6 +1162,7 @@ def node_merge_ready(state: dict, ctx: WorkflowContext) -> dict:
     st = _load(ctx, state)
     st.current_state = JobStatus.MERGE_READY
     st.merge_ready = True
+    st.escalated = False
     st.done = True
     if st.ci_result and st.ci_result.state == "pass":
         emit(st, events.MERGE_READY,
