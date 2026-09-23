@@ -59,6 +59,68 @@ def test_classify_environment_failures():
     assert classify_failures(failures) == "environment"
 
 
+def test_classify_toolchain_incompatibility():
+    failures = [
+        "error: rustc 1.85.1 is not supported by the following packages:",
+        "  uv@0.12.17 requires rustc 1.96.0",
+        "  time@0.3.47 requires rustc 1.88.0",
+    ]
+    assert classify_failures(failures) == "environment"
+
+
+def test_parse_failures_captures_toolchain_lines():
+    out = (
+        "error: rustc 1.85.1 is not supported by the following packages:\n"
+        "  uv@0.12.17 requires rustc 1.96.0"
+    )
+    f = parse_failures(out)
+    assert any("requires rustc" in x for x in f)
+
+
+def test_missing_module_is_environment():
+    failures = [
+        "E   ModuleNotFoundError: No module named 'httpx'",
+        "E   ModuleNotFoundError: No module named 'keyring'",
+        "E   ModuleNotFoundError: No module named 'built_by_uv'",
+    ]
+    assert classify_failures(failures) == "environment"
+
+
+def test_prefer_ecosystem_command_picks_rust(tmp_path: Path):
+    (tmp_path / "Cargo.toml").write_text("[package]")
+    from contributor.execution.tests import prefer_ecosystem_command
+
+    assert (
+        prefer_ecosystem_command(tmp_path, ["python -m pytest -q", "cargo test --quiet"])
+        == "cargo test --quiet"
+    )
+
+
+def test_prefer_ecosystem_command_picks_python(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]")
+    from contributor.execution.tests import prefer_ecosystem_command
+
+    assert prefer_ecosystem_command(tmp_path, ["cargo test --quiet", "pytest -q"]) == "pytest -q"
+
+
+def test_prefer_ecosystem_command_uv_prefix(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]")
+    (tmp_path / "uv.lock").write_text("")
+    from contributor.execution.tests import prefer_ecosystem_command
+
+    assert (
+        prefer_ecosystem_command(tmp_path, ["python -m pytest -q"])
+        == "uv run python -m pytest -q"
+    )
+
+
+def test_candidate_commands_uv_prefix(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]")
+    (tmp_path / "uv.lock").write_text("")
+    cmds = candidate_commands(tmp_path, "python", suggested=["python -m pytest -q"])
+    assert cmds[0] == "uv run python -m pytest -q"
+
+
 def test_classify_code_failures():
     failures = ["FAILED test_x.py::test_y - AssertionError: expected 1 got 2"]
     assert classify_failures(failures) == "code"

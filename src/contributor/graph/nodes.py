@@ -54,6 +54,19 @@ class WorkflowContext:
     github: GitHubClient
     sandbox: SandboxManager
     runner: OpenCodeRunner
+    # Benchmark mode: the graph terminates at review approval WITHOUT pushing a
+    # branch or creating a PR. Default False (normal contributor behavior).
+    benchmark_mode: bool = False
+    # Registry of in-sandbox sessions (OpenCode + deps + tests share one env).
+    sessions: Any = None
+    # Live contribution mode + orchestrator-owned push (never set by benchmark).
+    execution_mode: str = "benchmark"  # benchmark | live
+    allow_push: bool = False
+    allow_create_pr: bool = False
+    allow_comments: bool = False
+    allow_labels: bool = False
+    push_repo: str = ""  # OWNER/REPO target; empty => issue repository
+    push_remote: str = "origin"
 
     @property
     def repo(self) -> JobRepository:
@@ -72,6 +85,17 @@ class WorkflowContext:
         from contributor.agents.model_router import ModelRouter
 
         return ModelRouter(self.settings)
+
+
+def _runner_for(st: JobState, ctx: WorkflowContext):
+    """Return the in-sandbox runner when a session exists, else the host runner."""
+    if ctx.sessions is not None:
+        session = ctx.sessions.get(st.job_id)
+        if session is not None:
+            from contributor.opencode.runner import SandboxOpenCodeRunner
+
+            return SandboxOpenCodeRunner(session, ctx.settings)
+    return ctx.runner
 
 
 def _load(ctx: WorkflowContext, s: dict) -> JobState:
@@ -218,6 +242,95 @@ def node_plan(state: dict, ctx: WorkflowContext) -> dict:
     return _patch(st)
 
 
+def _env_cache_dir(st: JobState, ctx: WorkflowContext, plan) -> tuple[Path, bool]:
+    """Return (env_cache_dir, cache_hit). Keyed by repo + bootstrap spec."""
+    import hashlib
+
+    root = Path(ctx.settings.env_cache_root).expanduser()
+    key = hashlib.sha1(f"{st.repository}:{plan.cache_material()}".encode()).hexdigest()[:16]
+    d = root / key
+    cache_hit = d.exists() and any(d.iterdir())
+    d.mkdir(parents=True, exist_ok=True)
+    return d, cache_hit
+
+
+def _provision_environment(st: JobState, ctx: WorkflowContext, ws: Path) -> bool:
+    """Start the sandbox session, bootstrap the repo env, run preflight.
+
+    Returns True when the environment is healthy and implementation may proceed.
+    On failure sets a terminal state (ENVIRONMENT_FAILURE / RESOURCE_INCOMPATIBLE).
+    """
+    from contributor.models.state import EnvironmentReport
+    from contributor.sandbox.bootstrap import detect_bootstrap, run_bootstrap
+    from contributor.sandbox.health import run_preflight
+    from contributor.sandbox.resources import choose_resource_profile
+
+    report = st.environment_report or EnvironmentReport()
+    emit(st, events.ENVIRONMENT_DISCOVERY_STARTED, "Provisioning isolated environment", agent="environment")
+
+    selection = choose_resource_profile(report, requested=ctx.settings.resource_profile)
+    st.resource_profile = selection.profile.name
+    emit(st, events.ENVIRONMENT_DISCOVERY_COMPLETED,
+         f"resource profile={selection.profile.name} cpus={selection.profile.cpus} mem={selection.profile.memory}",
+         agent="environment", data={"warnings": selection.warnings, "reasons": selection.reasons})
+    if not selection.compatible:
+        st.current_state = JobStatus.RESOURCE_INCOMPATIBLE
+        st.escalated = True
+        st.human_escalation_reason = "Resource incompatible: " + "; ".join(selection.reasons)
+        st.errors.append(st.human_escalation_reason)
+        st.done = True
+        emit(st, events.REPO_ENV_UNSUPPORTED, st.human_escalation_reason, agent="environment")
+        return False
+
+    plan = detect_bootstrap(ws, report)
+    env_dir, cache_hit = _env_cache_dir(st, ctx, plan)
+    st.issue_metadata["env_cache_hit"] = cache_hit
+    try:
+        session = ctx.sessions.get_or_create(
+            st.job_id, workspace=ws, env_dir=env_dir, profile=selection.profile
+        )
+        session.start()
+    except Exception as e:
+        st.current_state = JobStatus.ENVIRONMENT_FAILURE
+        st.escalated = True
+        st.human_escalation_reason = f"Sandbox session failed to start: {e}"
+        st.errors.append(st.human_escalation_reason)
+        st.done = True
+        emit(st, events.REPO_ENV_UNSUPPORTED, st.human_escalation_reason, agent="environment")
+        return False
+
+    bootstrap_report = None
+    if ctx.settings.bootstrap_enabled and not plan.is_empty:
+        emit(st, events.ENVIRONMENT_DISCOVERY_STARTED,
+             f"bootstrap ecosystem={plan.ecosystem} commands={[c.label for c in plan.commands]}",
+             agent="environment")
+        bootstrap_report = run_bootstrap(session, plan, timeout_s=ctx.settings.bootstrap_timeout_s)
+    st.bootstrap_report = bootstrap_report or {"ecosystem": plan.ecosystem, "commands": [], "ok": True}
+    emit(st, events.ENVIRONMENT_DISCOVERY_COMPLETED,
+         f"bootstrap ok={st.bootstrap_report.get('ok')} duration={st.bootstrap_report.get('duration_s')}s",
+         agent="environment", data={"toolchain": plan.toolchain, "source": plan.source})
+
+    health = run_preflight(
+        session, plan,
+        bootstrap_report=st.bootstrap_report,
+        resource_warnings=selection.warnings,
+    )
+    st.environment_health = health.model_dump(mode="json")
+    emit(st, events.ENVIRONMENT_DISCOVERY_COMPLETED,
+         f"preflight healthy={health.healthy} missing={health.missing_tools} wrong={health.wrong_versions}",
+         agent="environment", data=health.model_dump(mode="json"))
+    if not health.healthy:
+        st.current_state = JobStatus.ENVIRONMENT_FAILURE
+        st.escalated = True
+        reasons = health.missing_tools + health.wrong_versions + health.dependency_failures
+        st.human_escalation_reason = "Environment preflight failed: " + "; ".join(reasons[:5])
+        st.errors.append(st.human_escalation_reason)
+        st.done = True
+        emit(st, events.REPO_ENV_UNSUPPORTED, st.human_escalation_reason, agent="environment")
+        return False
+    return True
+
+
 def node_prepare_workspace(state: dict, ctx: WorkflowContext) -> dict:
     st = _load(ctx, state)
     st.current_state = JobStatus.PREPARE_WORKSPACE
@@ -269,11 +382,18 @@ def node_prepare_workspace(state: dict, ctx: WorkflowContext) -> dict:
         cr = checkout_new_branch(ws, branch)
         if cr.exit_code != 0:
             raise RuntimeError(f"branch checkout failed: {cr.stderr[-500:]}")
-        from contributor.execution.git import ensure_scratch_dir
+        from contributor.execution.git import block_push, ensure_scratch_dir
 
         ensure_scratch_dir(ws)
+        block_push(ws)
         emit(st, events.WORKSPACE_CREATED, f"workspace={ws} branch={branch}")
-        st.current_state = JobStatus.IMPLEMENT
+        # Provision the isolated environment (toolchain + deps + OpenCode) before
+        # any agent work. Failures are terminal environment/resource states.
+        provisioned = True
+        if ctx.settings.sandbox_execution and ctx.sandbox.use_docker and ctx.sessions is not None:
+            provisioned = _provision_environment(st, ctx, ws)
+        if provisioned:
+            st.current_state = JobStatus.IMPLEMENT
     except Exception as e:
         st.errors.append(f"workspace failed: {e}")
         emit(st, events.JOB_FAILED, str(e))
@@ -342,7 +462,7 @@ def node_implement(state: dict, ctx: WorkflowContext) -> dict:
     st.issue_metadata.pop("provider_blocked", None)
     emit(st, events.IMPLEMENTATION_STARTED, f"attempt {st.implementation_attempt}", agent="implementer", attempt=st.implementation_attempt)
     try:
-        result = run_implementation(st, ctx.settings, ctx.runner, health_store=ctx.health)
+        result = run_implementation(st, ctx.settings, _runner_for(st, ctx), health_store=ctx.health)
         emit(st, events.IMPLEMENTATION_COMPLETED, f"exit={result.code} kind={result.error_kind or '-'}",
              agent="implementer", attempt=st.implementation_attempt,
              data={"exit_code": result.code, "error_kind": result.error_kind,
@@ -380,7 +500,22 @@ def node_test(state: dict, ctx: WorkflowContext) -> dict:
         for cmd in st.issue_metadata.get("env_test_commands", []) or []:
             if cmd not in suggested:
                 suggested.insert(0, cmd)
-        tr = TestRunner(ctx.sandbox, test_timeout_s=ctx.settings.test_timeout_s).run(ws, suggested=suggested)
+        session = ctx.sessions.get(st.job_id) if ctx.sessions is not None else None
+        runner = TestRunner(ctx.sandbox, test_timeout_s=ctx.settings.test_timeout_s, session=session)
+        tr = None
+        if ctx.benchmark_mode:
+            # Benchmark: smallest meaningful test set first (changed/related
+            # tests). Fall back to the repo's canonical suite when no targeted
+            # command can be derived.
+            from contributor.execution.git import working_tree_files
+
+            changed = working_tree_files(ws)
+            likely = st.plan.files_expected_to_change if st.plan else []
+            tr = runner.run_targeted(ws, changed_files=changed, likely_files=likely)
+            if tr is not None:
+                st.issue_metadata["targeted_test_command"] = tr.command
+        if tr is None:
+            tr = runner.run(ws, suggested=suggested)
         st.test_results.append(tr)
         if tr.passed:
             emit(st, events.TEST_PASSED, f"{tr.command} ({tr.duration_s:.1f}s)")
@@ -459,6 +594,19 @@ def node_environment_failure(state: dict, ctx: WorkflowContext) -> dict:
     return _patch(st)
 
 
+def node_resource_incompatible(state: dict, ctx: WorkflowContext) -> dict:
+    """Terminal: the repository build cannot fit available host resources."""
+    st = _load(ctx, state)
+    st.current_state = JobStatus.RESOURCE_INCOMPATIBLE
+    st.escalated = True
+    if not st.human_escalation_reason:
+        st.human_escalation_reason = "Repository build requires more resources than available."
+    emit(st, events.REPO_ENV_UNSUPPORTED, st.human_escalation_reason)
+    st.done = True
+    _save(ctx, st)
+    return _patch(st)
+
+
 def node_review(state: dict, ctx: WorkflowContext) -> dict:
     st = _load(ctx, state)
     st.current_state = JobStatus.REVIEW
@@ -492,7 +640,7 @@ def node_debug(state: dict, ctx: WorkflowContext) -> dict:
     st.issue_metadata.pop("provider_blocked", None)
     emit(st, events.REPAIR_STARTED, f"debug attempt {st.debug_attempt}", agent="debugger", attempt=st.debug_attempt)
     try:
-        result = run_debug(st, ctx.settings, ctx.runner, health_store=ctx.health)
+        result = run_debug(st, ctx.settings, _runner_for(st, ctx), health_store=ctx.health)
         emit(st, events.IMPLEMENTATION_COMPLETED, f"debug exit={result.code} kind={result.error_kind or '-'}",
              agent="debugger", attempt=st.debug_attempt,
              data={"exit_code": result.code, "error_kind": result.error_kind})
@@ -518,53 +666,134 @@ def node_debug(state: dict, ctx: WorkflowContext) -> dict:
 
 
 def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
+    """Publish a contribution: commit -> deterministic gate -> orchestrator push.
+
+    Benchmark mode is hard-blocked. The optional PR step is only attempted when
+    the live mode explicitly permits it; the first live mutation is push-only.
+    """
+    from contributor.execution.git import (
+        diff_full as _d,
+        has_changes as _hc,
+        head_sha,
+        log_last,
+    )
+    from contributor.execution.push_gate import run_push_gate
+    from contributor.execution.git import push_to_target
+
     st = _load(ctx, state)
     st.current_state = JobStatus.CREATE_PR
+    st.execution_mode = ctx.execution_mode
+
+    if ctx.benchmark_mode:
+        st.errors.append("benchmark mode forbids any GitHub mutation")
+        st.current_state = JobStatus.PUSH_GATE_REJECTED
+        st.escalated = True
+        st.human_escalation_reason = "benchmark mode forbids push"
+        emit(st, events.PUSH_GATE_REJECTED, st.human_escalation_reason)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    ws = Path(st.workspace_path) if st.workspace_path else Path(".")
+    target = ctx.push_repo or st.repository
+    st.push_target = target
+    st.push_remote = ctx.push_remote
+
+    # 1. hard deterministic gate on the uncommitted contribution.
+    gate = run_push_gate(
+        job=st, workspace=ws, settings=ctx.settings, allow_push=ctx.allow_push,
+        execution_mode=ctx.execution_mode, target_repo=target,
+        remote=ctx.push_remote, expected_repo=st.repository,
+    )
+    st.push_gate = gate.to_dict()
+    if not gate.allowed:
+        st.current_state = JobStatus.PUSH_GATE_REJECTED
+        st.escalated = True
+        st.human_escalation_reason = "push gate rejected: " + "; ".join(gate.reasons[:6])
+        st.errors.append(st.human_escalation_reason)
+        emit(st, events.PUSH_GATE_REJECTED, st.human_escalation_reason, data=st.push_gate)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+    emit(st, events.PUSH_GATE_PASSED, "deterministic push gate passed", data=st.push_gate)
+
+    # 2. exactly one coherent contribution commit (orchestrator-owned).
     try:
-        ws = Path(st.workspace_path)
-        if not has_changes(ws) and not st.pull_request_url:
-            # nothing to commit — check diff against HEAD; if empty, escalate
-            from contributor.execution.git import diff_full as _d
-
-            if not _d(ws).strip():
-                raise RuntimeError("No changes to create PR from (empty diff).")
-        msg = f"Fix #{st.issue_number}: {st.issue_title[:72]}"
-        cr = commit_all(ws, msg)
-        if cr.exit_code != 0:
-            raise RuntimeError(f"commit failed: {cr.stderr[-800:]}")
-        # push with token auth
-        import os
-
-        env = dict(os.environ)
-        token = ctx.settings.github_token
-        if token:
-            # embed token via http.extraHeader instead of URL to avoid leaking in logs
-            env["GIT_HTTP_EXTRAHEADER"] = ""
-        pr = push_branch(ws, st.branch_name, env={"GITHUB_TOKEN": token} if token else None)
-        # push_branch uses git push origin; for token auth, rewrite origin URL if needed
-        if pr.exit_code != 0:
-            # try token-in-url fallback for https origins
-            if token:
-                from contributor.execution.commands import run_command as _rc
-
-                owner_repo = st.repository
-                _rc(["git", "-C", str(ws), "remote", "set-url", "origin",
-                     f"https://x-access-token:{token}@github.com/{owner_repo}.git"], timeout=30)
-                pr = push_branch(ws, st.branch_name)
-            if pr.exit_code != 0:
-                raise RuntimeError(f"push failed: {pr.stderr[-1000:]}")
-        base = st.issue_metadata.get("default_branch", "main")
-        data = create_pr_for_job(ctx.github, st, ctx.settings, base=base)
-        st.pull_request_url = data.get("html_url", "")
-        st.pull_request_number = int(data.get("number", 0) or 0)
-        emit(st, events.PR_CREATED, st.pull_request_url)
-        st.current_state = JobStatus.PR_CI_CHECK
+        if _hc(ws):
+            msg = f"Fix #{st.issue_number}: {st.issue_title[:72]}"
+            cr = commit_all(ws, msg)
+            if cr.exit_code != 0:
+                raise RuntimeError(f"commit failed: {cr.stderr[-800:]}")
+            st.commit_sha = head_sha(ws)
+            emit(st, events.COMMIT_CREATED, f"{st.commit_sha[:12]} {msg}",
+                 data={"sha": st.commit_sha, "message": msg, "log": log_last(ws)})
+        elif st.commit_sha:
+            pass  # already committed
+        else:
+            raise RuntimeError("No changes to publish (empty diff).")
     except Exception as e:
-        st.errors.append(f"create_pr failed: {e}")
+        st.errors.append(f"commit failed: {e}")
         emit(st, events.JOB_FAILED, str(e))
         st.current_state = JobStatus.ESCALATE
         st.escalated = True
-        st.human_escalation_reason = f"PR creation failed: {e}"
+        st.human_escalation_reason = f"Commit failed: {e}"
+        _save(ctx, st)
+        return _patch(st)
+
+    # 3. orchestrator-owned push using the controlled credential.
+    token = ctx.settings.github_token
+    if not token:
+        st.current_state = JobStatus.PUSH_FAILED
+        st.escalated = True
+        st.human_escalation_reason = "push failed: no GITHUB_TOKEN configured"
+        st.push_result = {"target": target, "ok": False, "reason": st.human_escalation_reason}
+        emit(st, events.PUSH_FAILED, st.human_escalation_reason, data=st.push_result)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    url = f"https://x-access-token:{token}@github.com/{target}.git"
+    emit(st, events.PUSH_STARTED, f"pushing {st.branch_name} -> {target}")
+    pushed = push_to_target(ws, st.branch_name, url=url)
+    st.push_result = {
+        "target": target,
+        "remote": ctx.push_remote,
+        "branch": st.branch_name,
+        "commit_sha": st.commit_sha,
+        "exit_code": pushed.exit_code,
+        "ok": pushed.exit_code == 0,
+        "stdout_tail": pushed.stdout[-2000:],
+        "stderr_tail": pushed.stderr[-2000:],
+    }
+    if pushed.exit_code != 0:
+        st.current_state = JobStatus.PUSH_FAILED
+        st.escalated = True
+        st.human_escalation_reason = f"push failed: {pushed.stderr[-500:]}"
+        st.errors.append(st.human_escalation_reason)
+        emit(st, events.PUSH_FAILED, st.human_escalation_reason, data=st.push_result)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    emit(st, events.PUSHED, f"{target} {st.branch_name} {st.commit_sha[:12]}", data=st.push_result)
+    if ctx.allow_create_pr:
+        try:
+            base = st.issue_metadata.get("default_branch", "main")
+            data = create_pr_for_job(ctx.github, st, ctx.settings, base=base)
+            st.pull_request_url = data.get("html_url", "")
+            st.pull_request_number = int(data.get("number", 0) or 0)
+            emit(st, events.PR_CREATED, st.pull_request_url)
+            st.current_state = JobStatus.PR_CI_CHECK
+        except Exception as e:
+            st.errors.append(f"PR creation failed after push: {e}")
+            st.current_state = JobStatus.ESCALATE
+            st.escalated = True
+            st.human_escalation_reason = f"PR creation failed after push: {e}"
+            st.done = True
+    else:
+        st.current_state = JobStatus.PUSHED
+        st.human_escalation_reason = ""
+        st.done = True
     _save(ctx, st)
     return _patch(st)
 
@@ -623,6 +852,14 @@ def node_ci_check(state: dict, ctx: WorkflowContext) -> dict:
 def node_update_pr(state: dict, ctx: WorkflowContext) -> dict:
     st = _load(ctx, state)
     st.current_state = JobStatus.UPDATE_PR
+    if ctx.benchmark_mode:
+        st.errors.append("benchmark mode forbids PR updates")
+        st.current_state = JobStatus.ESCALATE
+        st.escalated = True
+        st.human_escalation_reason = "benchmark mode forbids PR updates"
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
     try:
         ws = Path(st.workspace_path)
         from contributor.execution.git import has_changes as _hc, commit_all as _ca, push_branch as _pb
@@ -675,6 +912,27 @@ def node_wait_review(state: dict, ctx: WorkflowContext) -> dict:
         st.errors.append(f"wait_review failed: {e}")
         st.done = True
         st.current_state = JobStatus.DONE
+    _save(ctx, st)
+    return _patch(st)
+
+
+def node_finalize_benchmark(state: dict, ctx: WorkflowContext) -> dict:
+    """Terminal node for benchmark mode: review approved, but NO push/PR.
+
+    The final local diff and workspace remain on disk for inspection.
+    """
+    st = _load(ctx, state)
+    approved = bool(st.review_result and st.review_result.verdict.value == "approved")
+    if approved:
+        st.current_state = JobStatus.DONE
+        st.done = True
+        emit(st, events.JOB_COMPLETED, "Benchmark run complete (review approved; no PR created)")
+    else:
+        st.current_state = JobStatus.ESCALATE
+        st.escalated = True
+        st.human_escalation_reason = st.human_escalation_reason or "Benchmark: review not approved"
+        st.done = True
+        emit(st, events.HUMAN_ESCALATION, st.human_escalation_reason)
     _save(ctx, st)
     return _patch(st)
 

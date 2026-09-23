@@ -91,6 +91,23 @@ class Settings(BaseSettings):
     sandbox_fallback_local: bool = True
     require_docker: bool = False
 
+    # --- In-sandbox execution (OpenCode + repository env inside one container) ---
+    # When True (and Docker is available) OpenCode, dependencies, toolchain and
+    # tests all run inside the same long-lived sandbox session.
+    sandbox_execution: bool = True
+    sandbox_workspace_mount: str = Field(default="/workspace/repo")
+    sandbox_env_mount: str = Field(default="/opt/env")
+    # Host cache directory for toolchains/dependencies, reused across jobs.
+    env_cache_root: str = Field(default="~/.cache/contributor-env")
+    # OpenCode material mounted read-only into the sandbox (never copied into images).
+    opencode_host_binary: str = Field(default="", description="Host path; resolved via PATH when empty")
+    opencode_auth_file: str = Field(default="~/.local/share/opencode/auth.json")
+    opencode_config_file: str = Field(default="~/.config/opencode/opencode.json")
+    # Resource profile: auto|small|medium|large (capped by host capacity).
+    resource_profile: str = Field(default="auto")
+    bootstrap_timeout_s: int = 1800
+    bootstrap_enabled: bool = True
+
     # Persistence
     database_url: str = Field(default="sqlite:///./contributor.db")
     # Resolve sqlite path relative to CWD at runtime; postgres URLs passed through.

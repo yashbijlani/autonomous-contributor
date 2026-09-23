@@ -26,19 +26,34 @@ app = typer.Typer(no_args_is_help=True, add_completion=False)
 console = Console()
 
 
-def make_context() -> WorkflowContext:
+def make_context(
+    *,
+    execution_mode: str = "benchmark",
+    allow_push: bool = False,
+    allow_create_pr: bool = False,
+    push_repo: str = "",
+    push_remote: str = "origin",
+) -> WorkflowContext:
     settings = get_settings()
     setup_logging(settings.log_level, settings.log_json)
     db = Database(settings.database_url)
     github = GitHubClient(token=settings.github_token, api_base=settings.github_api_base, timeout=settings.github_timeout_s)
     sandbox = SandboxManager(settings)
     runner = OpenCodeRunner(settings)
-    return WorkflowContext(settings=settings, db=db, github=github, sandbox=sandbox, runner=runner)
+    from contributor.sandbox.session import SandboxSessionRegistry
+
+    return WorkflowContext(
+        settings=settings, db=db, github=github, sandbox=sandbox, runner=runner,
+        sessions=SandboxSessionRegistry(settings),
+        execution_mode=execution_mode, allow_push=allow_push, allow_create_pr=allow_create_pr,
+        push_repo=push_repo, push_remote=push_remote,
+    )
 
 
 def _create_job(ctx: WorkflowContext, ref: IssueRef) -> JobState:
     job = JobState(job_id=new_job_id(), repository=ref.full_name, issue_number=ref.number)
-    job.add_event("JOB_CREATED", f"Created for {ref.short}")
+    job.execution_mode = ctx.execution_mode
+    job.add_event("JOB_CREATED", f"Created for {ref.short} mode={ctx.execution_mode}")
     ctx.repo.save_incremental(job)
     return job
 
@@ -96,16 +111,64 @@ def issue(ref: str, dry_run: bool = typer.Option(False, help="Only fetch + triag
 
 
 @app.command()
-def run(ref: str):
-    """Run the full autonomous workflow for OWNER/REPO#123."""
-    ctx = make_context()
+def run(
+    ref: str,
+    push: bool = typer.Option(False, "--push/--no-push", help="Live mode: allow orchestrator push"),
+    create_pr: bool = typer.Option(False, "--pr/--no-pr", help="Live mode: also open a PR (default off)"),
+    push_repo: str = typer.Option("", "--push-repo", help="Push target OWNER/REPO (default: issue repo)"),
+    push_remote: str = typer.Option("origin", "--push-remote", help="Remote name label for the push target"),
+):
+    """Run the autonomous workflow for OWNER/REPO#123.
+
+    Without --push this is non-destructive (no GitHub mutation).
+    """
+    mode = "live" if push else "benchmark"
+    ctx = make_context(
+        execution_mode=mode, allow_push=push, allow_create_pr=create_pr,
+        push_repo=push_repo, push_remote=push_remote,
+    )
     issue_ref = IssueRef.parse(ref)
     job = _create_job(ctx, issue_ref)
-    console.print(f"[bold]Job {job.job_id}[/bold] for {issue_ref.short}")
+    console.print(
+        f"[bold]Job {job.job_id}[/bold] for {issue_ref.short} "
+        f"mode={mode} push={push} pr={create_pr} target={push_repo or issue_ref.full_name}"
+    )
     if not _preflight_gate(ctx, job):
         raise typer.Exit(2)
     final = run_to_completion(ctx, job)
-    console.print(f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'} escalated={final.escalated}")
+    console.print(
+        f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'} "
+        f"pushed={bool(final.push_result and final.push_result.get('ok'))} "
+        f"target={final.push_target or '-'} escalated={final.escalated}"
+    )
+
+
+@app.command()
+def live(
+    ref: str,
+    push_repo: str = typer.Option("", "--push-repo", help="Push target OWNER/REPO (e.g. fork)"),
+    push_remote: str = typer.Option("origin", "--push-remote"),
+    create_pr: bool = typer.Option(False, "--pr/--no-pr"),
+):
+    """Live contribution: implement, verify, and PUSH the branch (no PR by default)."""
+    ctx = make_context(
+        execution_mode="live", allow_push=True, allow_create_pr=create_pr,
+        push_repo=push_repo, push_remote=push_remote,
+    )
+    issue_ref = IssueRef.parse(ref)
+    job = _create_job(ctx, issue_ref)
+    console.print(
+        f"[bold]LIVE[/bold] job={job.job_id} issue={issue_ref.short} "
+        f"target={push_repo or issue_ref.full_name}"
+    )
+    if not _preflight_gate(ctx, job):
+        raise typer.Exit(2)
+    final = run_to_completion(ctx, job)
+    console.print(
+        f"Done: state={final.current_state.value} pushed="
+        f"{bool(final.push_result and final.push_result.get('ok'))} "
+        f"branch={final.branch_name or '-'} sha={final.commit_sha[:12] or '-'}"
+    )
 
 
 @app.command()
@@ -255,6 +318,84 @@ def doctor(
         console.print("[green]doctor: healthy[/green]" if rep.ok else "[red]doctor: problems found[/red]")
     if not rep.ok:
         raise typer.Exit(1)
+
+
+@app.command()
+def benchmark(
+    repo: str = typer.Option(..., "--repo", help="OWNER/REPO to benchmark"),
+    count: int = typer.Option(5, "--count", help="Number of issues to attempt"),
+    workers: int = typer.Option(1, "--workers", help="Concurrent issue workers"),
+    label: list[str] = typer.Option([], "--label", help="Repeatable label filter"),
+    issue: list[int] = typer.Option([], "--issue", help="Force specific issue numbers (repeatable)"),
+    max_complexity: int = typer.Option(3, "--max-complexity", help="Max estimated complexity (1-5)"),
+    pool_size: int = typer.Option(100, "--pool-size", help="Candidate pool size before selection"),
+    out: str = typer.Option(".", "--out", help="Output dir for benchmark-report.{json,md} and diffs"),
+    full_suite: bool = typer.Option(True, "--full-suite/--no-full-suite", help="Run the broader suite after targeted tests"),
+    no_preflight: bool = typer.Option(False, "--no-preflight", help="Skip OpenCode preflight probes"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Select issues only; do not execute"),
+    no_llm_triage: bool = typer.Option(False, "--no-llm-triage", help="Use only deterministic triage (no cheap-model pass)"),
+    push: bool = typer.Option(False, "--push", help="(disabled) allow pushing branches"),
+    create_pr: bool = typer.Option(False, "--pr", help="(disabled) allow opening PRs"),
+):
+    """Benchmark the contributor against a real repository (non-destructive by default).
+
+    Discovery -> structured triage -> environment discovery -> transparent
+    selection -> execute -> targeted tests -> broader tests -> review.
+    Never pushes branches or opens PRs.
+    """
+    if push or create_pr:
+        console.print(
+            "[red]benchmark mode is non-destructive: pushing branches / opening PRs is "
+            "not supported here. Use `contributor run` for the PR workflow.[/red]"
+        )
+        raise typer.Exit(2)
+
+    from contributor.benchmark.models import BenchmarkConfig
+    from contributor.benchmark.runner import run_benchmark
+
+    cfg = BenchmarkConfig(
+        repo=repo,
+        count=max(1, count),
+        workers=max(1, workers),
+        labels=list(label),
+        issues=list(issue),
+        max_complexity=max_complexity,
+        pool_size=max(pool_size, count),
+        output_dir=out,
+        full_suite=full_suite,
+        no_push=True,
+        no_pr=True,
+        preflight=not no_preflight,
+        dry_run=dry_run,
+        llm_triage=not no_llm_triage,
+    )
+    ctx = make_context()
+    console.print(
+        f"[bold]Benchmark[/bold] {cfg.repo} count={cfg.count} workers={cfg.workers} "
+        f"labels={cfg.labels or '(none)'} max_complexity={cfg.max_complexity}"
+    )
+
+    def _progress(rec) -> None:
+        console.print(
+            f"  #{rec.issue_number} -> [bold]{rec.outcome.value}[/bold] "
+            f"({rec.duration_s:.0f}s, impl={rec.implementation_attempts}, "
+            f"debug={rec.debug_attempts}, tests={rec.targeted_tests.get('passed')})"
+        )
+
+    try:
+        report = run_benchmark(ctx, cfg, progress=_progress)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(2)
+
+    s = report.summary
+    console.print(
+        f"\n[green]attempted={s.issues_attempted} success={s.successful} "
+        f"success_after_repair={s.successful_after_repair} "
+        f"test_failures={s.test_failures} env={s.environment_failures} "
+        f"provider={s.provider_failures} human={s.human_escalations}[/green]"
+    )
+    console.print(f"reports: {cfg.output_dir}/benchmark-report.json, {cfg.output_dir}/benchmark-report.md")
 
 
 @app.command()

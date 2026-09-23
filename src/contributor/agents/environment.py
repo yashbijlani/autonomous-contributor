@@ -22,13 +22,23 @@ EXT_LANG = {
     ".lua": "lua", ".cs": "csharp", ".swift": "swift",
 }
 
-# Known host tools we care about (missing in slim containers).
+# Known host tools we care about (missing in slim containers). Reported for
+# transparency. Many are generic CI/setup tools (docker, jq, sudo) that appear
+# in nearly every project's CI without implying the *tests* need the host.
 KNOWN_TOOLS = [
     "lua", "luajit", "magick", "convert", "jq", "mise", "updatedb", "systemctl",
     "docker", "podman", "hyprctl", "wpctl", "nmcli", "pactl", "gsettings",
     "dbus-send", "udevadm", "mount", "chroot", "pacman", "sudo", "ffmpeg",
     "pandoc", "chromium", "google-chrome", "xdotool", "wl-copy", "gum",
 ]
+
+# Subset that genuinely indicates host/desktop integration rather than generic
+# CI tooling. Only these count toward the host-runtime heuristic.
+HOST_ONLY_TOOLS = {
+    "lua", "luajit", "magick", "convert", "mise", "updatedb", "systemctl",
+    "hyprctl", "wpctl", "nmcli", "pactl", "gsettings", "dbus-send", "udevadm",
+    "chroot", "pacman", "xdotool", "wl-copy", "gum",
+}
 
 # Files worth fetching for analysis (bounded).
 CANDIDATE_FILES = [
@@ -173,7 +183,9 @@ def discover_environment(
     blob = (combined + "\n" + env_text).lower()
     requires_systemd = bool(re.search(r"\bsystemctl\b|\bsystemd\b|\.service\b", blob))
     privileged = bool(re.search(r"\bsudo\b|\bchroot\b|\bpacman\b|\bmount\b|\budevadm\b", blob))
-    unsafe = bool(re.search(r"\bchroot\b|\bmount\b|\bmkfs\b|\bdd\s+if=|\budevadm\b|\blosetup\b|\bmodprobe\b", blob))
+    # `mount` alone is common in CI (tmpfs/overlay) and is not destructive; only
+    # genuinely dangerous operations mark a repo unsafe.
+    unsafe = bool(re.search(r"\bchroot\b|\bmkfs\b|\bdd\s+if=|\budevadm\b|\blosetup\b|\bmodprobe\b", blob))
     network_required = bool(re.search(r"\bcurl\b|\bwget\b|\bnpm install\b|\bpip install\b|\bgit clone\b", blob))
     if requires_systemd:
         signals.append("systemd")
@@ -182,13 +194,15 @@ def discover_environment(
     if unsafe:
         signals.append("unsafe_ops")
 
-    # Host-runtime heuristic: shell install suites / many missing host tools /
-    # systemd / privileged operations / hardware configs.
+    # Host-runtime heuristic: shell install suites / genuine host-only tools /
+    # systemd / privileged operations / hardware configs. Generic CI tooling
+    # (docker/jq/sudo) must NOT count, or every mature repo is misclassified.
+    host_tools = [t for t in required_tools if t in HOST_ONLY_TOOLS]
     host_markers = sum([
         requires_systemd,
         privileged,
         "shell_test_suite" in signals,
-        len(required_tools) >= 3,
+        len(host_tools) >= 1,
         "install/" in " ".join(paths) or any(p.startswith("install/") for p in paths),
         bool(re.search(r"\bhyprland\b|\bwaybar\b|\bomarchy\b", blob)),
     ])
@@ -201,7 +215,7 @@ def discover_environment(
     if privileged:
         reasons.append("uses privileged operations (sudo/pacman/mount/udev)")
 
-    container_compatible = not (requires_systemd or requires_host_runtime or privileged)
+    container_compatible = not (requires_systemd or requires_host_runtime)
     if container_compatible:
         reasons.append("no host-runtime or privileged requirements detected")
 

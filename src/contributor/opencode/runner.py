@@ -200,3 +200,64 @@ class OpenCodeRunner:
             OpenCodeRequest(prompt=prompt, model=model, variant=variant, workdir=str(workdir)),
             timeout=timeout,
         )
+
+
+class SandboxOpenCodeRunner:
+    """Runs OpenCode inside a live SandboxSession (same env as tests).
+
+    The prompt is passed as a direct argv element (no shell), so repository
+    content cannot influence quoting. Provider auth stays read-only in the
+    session; the host filesystem is not exposed.
+    """
+
+    def __init__(self, session, settings: Settings):
+        self.session = session
+        self.settings = settings
+
+    @property
+    def available(self) -> bool:
+        return True
+
+    def cancel(self) -> None:  # pragma: no cover - interface parity
+        pass
+
+    def reset(self) -> None:  # pragma: no cover - interface parity
+        pass
+
+    def run(self, req: OpenCodeRequest, *, timeout: int | None = None) -> OpenCodeResult:
+        timeout = timeout or self.settings.opencode_timeout_s
+        argv = build_argv(self.settings, req)
+        # In the sandbox the binary is on PATH; cwd is the mounted repo.
+        res = self.session.exec_argv(
+            argv,
+            timeout=timeout,
+            workdir=self.settings.sandbox_workspace_mount,
+        )
+        out = (res.stdout or "")[-20000:]
+        err = (res.stderr or "")[-20000:]
+        if res.timed_out:
+            kind = ERROR_PROVIDER_TIMEOUT
+        elif res.exit_code != 0:
+            kind = classify_error(res.exit_code, out, err)
+        elif detect_permission_rejection(out, err):
+            kind = ERROR_PERMISSION_REJECTED
+        else:
+            kind = ""
+        return OpenCodeResult(
+            res.exit_code, out, err, res.duration_s,
+            timed_out=res.timed_out, model=req.model, variant=req.variant, error_kind=kind,
+        )
+
+    def run_with_prompt(
+        self,
+        prompt: str,
+        *,
+        workdir: str | Path,
+        model: str = "",
+        variant: str = "",
+        timeout: int | None = None,
+    ) -> OpenCodeResult:
+        return self.run(
+            OpenCodeRequest(prompt=prompt, model=model, variant=variant, workdir=str(workdir)),
+            timeout=timeout,
+        )

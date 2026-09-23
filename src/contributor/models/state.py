@@ -39,6 +39,14 @@ class JobStatus(str, Enum):
     REPOSITORY_ENVIRONMENT_INCOMPATIBLE = "repository_environment_incompatible"
     # Tests failed because dependencies/environment are missing (CASE E).
     ENVIRONMENT_FAILURE = "environment_failure"
+    # The repository build genuinely cannot fit host resources.
+    RESOURCE_INCOMPATIBLE = "resource_incompatible"
+    # Live contribution: orchestrator pushed the contribution branch.
+    PUSHED = "pushed"
+    # Live contribution: push attempted and failed (distinct from impl failure).
+    PUSH_FAILED = "push_failed"
+    # Final deterministic gate refused to push (not a code failure).
+    PUSH_GATE_REJECTED = "push_gate_rejected"
 
 
 class TriageDecision(str, Enum):
@@ -122,6 +130,33 @@ class TriageResult(BaseModel):
     reason: str = ""
     recommended_model: Literal["high", "xhigh"] = "high"
     security_flag: bool = False
+
+
+class TriageAssessment(BaseModel):
+    """Structured, factual solvability assessment for benchmark triage.
+
+    Deliberately NOT an aggregate "quality score": every dimension is recorded
+    separately so selection can apply transparent, configurable filters.
+    Derived deterministically from the issue title/body/labels (facts, not
+    guesses). Human-baseline dimensions are kept separate from solvability.
+    """
+
+    actionable: bool = False
+    reproducible: bool = False
+    clear_expected_behavior: bool = False
+    likely_code_change: bool = False
+    likely_test_change: bool = False
+    container_testable: bool = False
+    requires_maintainer_decision: bool = False
+    requires_external_service: bool = False
+    estimated_complexity: int = Field(default=3, ge=1, le=5)
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    # Human-baseline dimensions (never collapsed into a single score).
+    clear_reproduction: bool = False
+    existing_relevant_tests: bool = False
+    clear_location_in_code: bool = False
+    obvious_acceptance_condition: bool = False
+    signals: list[str] = Field(default_factory=list)
 
 
 class ImplementationPlan(BaseModel):
@@ -212,6 +247,17 @@ class JobState(BaseModel):
     human_escalation_reason: str = ""
     escalated: bool = False
     done: bool = False
+    # In-sandbox environment provisioning (bootstrap + preflight).
+    bootstrap_report: dict[str, Any] | None = None
+    environment_health: dict[str, Any] | None = None
+    resource_profile: str = ""
+    # Live contribution mode + orchestrator-owned push.
+    execution_mode: str = "benchmark"  # benchmark | live
+    commit_sha: str = ""
+    push_remote: str = ""
+    push_target: str = ""
+    push_gate: dict[str, Any] | None = None
+    push_result: dict[str, Any] | None = None
 
     def touch(self) -> None:
         self.updated_at = utcnow_iso()

@@ -14,6 +14,9 @@ Rules:
 - Preserve existing public APIs unless the issue requires otherwise.
 - Add or update regression tests covering the fix.
 - Follow repository conventions (style, lint, CONTRIBUTING.md).
+- Run only the SMALLEST meaningful check for what you changed (e.g. a single
+  crate/module test or `cargo check -p <crate>`). Do NOT run the full repository
+  suite or full release builds — the orchestrator runs the broader tests.
 - Do NOT modify unrelated files.
 - Do NOT commit, do NOT push, do NOT create branches — the orchestrator owns git.
 - Do NOT access network services with credentials.

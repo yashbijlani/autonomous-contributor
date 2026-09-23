@@ -28,3 +28,15 @@ def test_accepts_good_bug():
     tr = triage_issue("Crash on startup", "Traceback (most recent call last): ... app crashes on startup when config missing. " * 3)
     assert tr.decision.value == "accept"
     assert tr.recommended_model in ("high", "xhigh")
+
+
+def test_likely_files_ignores_absolute_and_cache_paths():
+    body = (
+        "Traceback shows /home/user/.cache/uv/builds-v0/.tmp/bin/x and "
+        "src/uv/resolver.py and tests/test_resolver.py. " * 3
+    )
+    tr = triage_issue("Resolver crash", body)
+    assert "src/uv/resolver.py" in tr.likely_files
+    assert "tests/test_resolver.py" in tr.likely_files
+    assert not any(p.startswith("/") for p in tr.likely_files)
+    assert not any(".cache" in p for p in tr.likely_files)

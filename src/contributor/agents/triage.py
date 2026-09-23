@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 
-from contributor.models.state import TriageDecision, TriageResult
+from contributor.models.state import TriageAssessment, TriageDecision, TriageResult
 
 # --- hard blocklist (programmatic, not LLM-decidable) ---
 BLOCKLIST = [
@@ -107,8 +107,21 @@ def triage_issue(
     elif issue_type == "feature":
         difficulty = max(difficulty, 3)
     difficulty = max(1, min(5, difficulty))
-    # 6. likely files: extract paths mentioned
-    likely = sorted(set(re.findall(r"[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|rb|php)", text)))[:10]
+    # 6. likely files: extract repo-relative paths mentioned. Absolute paths and
+    # home-dir cache paths (common in issue text) are dropped so the plan is not
+    # polluted with non-existent files.
+    raw_paths = re.findall(
+        r"[A-Za-z0-9_./-]+\.(?:py|ts|tsx|js|jsx|go|rs|java|cpp|c|h|rb|php|toml)", text
+    )
+    likely: list[str] = []
+    for p in raw_paths:
+        if p.startswith(("/", "~", "$")) or ".." in p:
+            continue
+        if any(seg.startswith(".") and seg not in (".",) for seg in p.split("/")):
+            continue
+        if p not in likely:
+            likely.append(p)
+    likely = sorted(likely)[:10]
     confidence = 0.7 if len((body or "")) > 100 else 0.55
     tier = "xhigh" if difficulty >= 4 else "high"
     return TriageResult(
@@ -117,4 +130,181 @@ def triage_issue(
         requires_human=False,
         reason=f"Accepted: {issue_type} (difficulty {difficulty}). Sufficient detail to attempt.",
         recommended_model=tier,  # type: ignore[arg-type]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Structured solvability assessment (benchmark triage)
+#
+# Every dimension is factual and derived from the issue body/title/labels.
+# Labels inform but never decide: the body is always inspected. There is no
+# aggregate score; callers filter on explicit dimensions.
+# ---------------------------------------------------------------------------
+
+REPRO_PATTERNS = [
+    r"steps? to reproduce", r"to reproduce", r"\breproduc", r"\brepro\b",
+    r"minimal (repro|example|reproduction)", r"how to reproduce",
+    r"traceback", r"stack ?trace", r"```",
+    r"expected\b.{0,80}\b(actual|got|instead|but)\b",
+]
+EXPECTED_PATTERNS = [
+    r"expected (behavior|behaviour|result|output|value)", r"\bexpected\b",
+    r"should (be|return|print|raise|work|not)",
+    r"i expected", r"acceptance criteri", r"instead(,| )", r"would expect",
+]
+CODE_CHANGE_PATTERNS = [
+    r"\bbug\b", r"\bcrash", r"\berror\b", r"\bexception\b", r"traceback", r"regression",
+    r"incorrect", r"\bwrong\b", r"doesn.?t work", r"\bnot work", r"\bfails?\b", r"broken",
+]
+TEST_CHANGE_PATTERNS = [r"\btest", r"regression", r"coverage", r"fixture", r"\bassert"]
+DOCS_ONLY_PATTERNS = [r"documentation", r"\bdocs?\b", r"\btypo\b", r"\breadme\b"]
+MAINTAINER_PATTERNS = HUMAN_REQUIRED_PATTERNS + [
+    r"\brfc\b", r"proposal", r"design doc", r"which approach", r"should we keep",
+]
+EXTERNAL_SERVICE_PATTERNS = [
+    r"external (service|api|dependency|system)", r"third.?party", r"\bwebhook\b",
+    r"\boauth\b", r"\b(s3|aws|gcp|azure|postgres|mysql|redis|kafka|rabbitmq|elasticsearch)\b",
+    r"\bkubernetes\b", r"\bk8s\b", r"\bdocker registry\b", r"\bapi key\b",
+    r"network (access|required)", r"requires? (a|an) (server|database|service)",
+]
+HOST_ONLY_PATTERNS = [
+    r"\bsystemd\b", r"\bsystemctl\b", r"\bsudo\b", r"\bwindows\b", r"\bmacos?\b",
+    r"\bmac os\b", r"\bgpu\b", r"\bcuda\b", r"graphics? card", r"\bdisplay\b",
+    r"\bandroid\b", r"\bios\b", r"\bhardware\b", r"\busb\b", r"serial port",
+    r"\bbluetooth\b", r"\bcamera\b",
+]
+SECURITY_PATTERNS = [
+    r"\bsecurity\b", r"\bvulnerab", r"\bcve\b", r"\bexploit\b", r"\bxss\b",
+    r"sql injection", r"path traversal", r"arbitrary (file|code|command|write|read)",
+    r"symlink.*(truncat|overwrit|escape|outside|follow)", r"\btoctou\b",
+    r"privilege escalation", r"denial of service", r"remote code execution",
+]
+COMPLEXITY_HIGH_PATTERNS = [
+    r"architect", r"\brefactor", r"\bmigration\b", r"race condition", r"deadlock",
+    r"concurren", r"distributed", r"redesign", r"breaking change", r"large",
+    r"across (many|multiple) modules", r"new subsystem",
+]
+SOURCE_PATH_RE = re.compile(
+    r"[A-Za-z0-9_./-]+\.(?:py|rs|ts|tsx|js|jsx|go|java|rb|php|c|cpp|h|toml|yaml|yml|json)"
+)
+CODE_LOCATION_HINTS = [r"\bdef \w+", r"\bclass \w+", r"function \w+", r"module\b", r"\bsrc/\w+"]
+
+AVOID_LABELS = {
+    "needs-mre", "needs mre", "needs-repro", "question", "support", "invalid",
+    "duplicate", "wontfix", "stale", "security", "breaking-change", "rfc", "discussion",
+}
+GOOD_LABELS = {"good first issue", "good-first-issue", "help wanted", "help-wanted", "e-easy", "easy"}
+
+
+def _any(patterns: list[str], text: str) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
+
+
+def _label_set(labels: list[str]) -> set[str]:
+    return {str(l).strip().lower() for l in (labels or [])}
+
+
+def assess_solvability(
+    title: str,
+    body: str,
+    *,
+    labels: list[str] | None = None,
+) -> TriageAssessment:
+    """Deterministic structured assessment. Inspects the body; labels are advisory."""
+    labels_norm = _label_set(labels or [])
+    text = f"{title}\n{body or ''}"
+    low = text.lower()
+    signals: list[str] = []
+
+    clear_reproduction = _any(REPRO_PATTERNS, text)
+    clear_expected = _any(EXPECTED_PATTERNS, text)
+    code_signal = _any(CODE_CHANGE_PATTERNS, text)
+    test_signal = _any(TEST_CHANGE_PATTERNS, text)
+    docs_only = _any(DOCS_ONLY_PATTERNS, text) and not code_signal
+    security = _any(SECURITY_PATTERNS, text) or "security" in labels_norm
+    maintainer = security or _any(MAINTAINER_PATTERNS, text) or bool(
+        labels_norm & {"needs-discussion", "needs-design", "breaking-change", "rfc", "discussion"}
+    )
+    external = _any(EXTERNAL_SERVICE_PATTERNS, text)
+    host_only = _any(HOST_ONLY_PATTERNS, text)
+
+    mentions_source = bool(SOURCE_PATH_RE.search(text))
+    code_location = mentions_source or _any(CODE_LOCATION_HINTS, text)
+
+    if clear_reproduction:
+        signals.append("reproduction_steps")
+    if clear_expected:
+        signals.append("expected_behavior")
+    if code_signal:
+        signals.append("code_signal")
+    if test_signal:
+        signals.append("test_signal")
+    if docs_only:
+        signals.append("docs_only")
+    if security:
+        signals.append("security")
+    if maintainer:
+        signals.append("maintainer_decision")
+    if external:
+        signals.append("external_service")
+    if host_only:
+        signals.append("host_only")
+    if code_location:
+        signals.append("code_location")
+    if labels_norm & GOOD_LABELS:
+        signals.append("good_first_issue_label")
+    avoid = labels_norm & AVOID_LABELS
+    if avoid:
+        signals.append("avoid_label:" + ",".join(sorted(avoid)))
+
+    # Complexity (1..5) from body size, scope keywords, files mentioned, labels.
+    complexity = 2
+    if len(body or "") > 2500:
+        complexity += 1
+    if _any(COMPLEXITY_HIGH_PATTERNS, text):
+        complexity += 2
+    if len(set(SOURCE_PATH_RE.findall(text))) > 3:
+        complexity += 1
+    if docs_only:
+        complexity -= 2
+    if labels_norm & GOOD_LABELS:
+        complexity = min(complexity, 2)
+    complexity = max(1, min(5, complexity))
+
+    body_stripped = (body or "").strip()
+    blocked_label = bool(labels_norm & {"needs-mre", "needs mre", "needs-repro"})
+    question_label = bool(labels_norm & {"question", "support"})
+    actionable = (
+        len(body_stripped) >= 40
+        and not blocked_label
+        and not question_label
+        and not docs_only
+    )
+    if len(body_stripped) < 40:
+        signals.append("body_too_short")
+
+    positive = sum([
+        clear_reproduction, clear_expected, code_signal, test_signal,
+        code_location, actionable,
+    ])
+    confidence = min(0.95, 0.35 + 0.10 * positive)
+    if labels_norm & GOOD_LABELS:
+        confidence = min(0.95, confidence + 0.10)
+
+    return TriageAssessment(
+        actionable=actionable,
+        reproducible=clear_reproduction,
+        clear_expected_behavior=clear_expected,
+        likely_code_change=code_signal and not docs_only,
+        likely_test_change=test_signal,
+        container_testable=not host_only,
+        requires_maintainer_decision=maintainer,
+        requires_external_service=external,
+        estimated_complexity=complexity,
+        confidence=round(confidence, 2),
+        clear_reproduction=clear_reproduction,
+        existing_relevant_tests=test_signal,
+        clear_location_in_code=code_location,
+        obvious_acceptance_condition=clear_expected and (clear_reproduction or test_signal),
+        signals=signals,
     )

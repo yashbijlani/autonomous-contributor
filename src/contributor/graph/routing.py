@@ -36,6 +36,18 @@ def after_environment(state: dict, settings: Settings) -> str:
     return "plan"
 
 
+def after_prepare(state: dict) -> str:
+    """Provisioning may terminate with an environment/resource state."""
+    cs = state.get("current_state", "")
+    if cs == "resource_incompatible":
+        return "resource_incompatible"
+    if cs == "environment_failure":
+        return "environment_failure"
+    if cs == "escalate":
+        return "escalate"
+    return "implement"
+
+
 def after_implement(state: dict) -> str:
     """Provider failures cannot be fixed by testing/debugging — stop immediately."""
     meta = state.get("issue_metadata") or {}
@@ -70,11 +82,13 @@ def after_test(state: dict, settings: Settings) -> str:
     return "escalate"
 
 
-def after_review(state: dict, settings: Settings) -> str:
+def after_review(state: dict, settings: Settings, benchmark: bool = False) -> str:
     rr = state.get("review_result") or {}
     v = rr.get("verdict", "human_required")
     has_pr = bool(state.get("pull_request_url"))
     if v == "approved":
+        if benchmark:
+            return "finalize_benchmark"
         return "update_pr" if has_pr else "create_pr"
     if v == "human_required":
         return "escalate"
@@ -90,6 +104,11 @@ def after_review(state: dict, settings: Settings) -> str:
             return "debug"
         return "escalate"
     return "implement"
+
+
+def after_create_pr(state: dict) -> str:
+    """After publishing: terminal for push-only mode, else continue to CI."""
+    return "__end__" if state.get("done") else "ci_check"
 
 
 def after_ci(state: dict, settings: Settings | None = None) -> str:
