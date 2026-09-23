@@ -28,6 +28,7 @@ class GitHubClientProtocol(Protocol):
     def search_issues(self, query: str, **kwargs) -> list[dict[str, Any]]: ...
     def create_pr(self, owner: str, repo: str, *, title: str, head: str, base: str, body: str) -> dict[str, Any]: ...
     def update_pr(self, owner: str, repo: str, number: int, **kwargs) -> dict[str, Any]: ...
+    def list_pull_requests(self, owner: str, repo: str, *, head: str = "", state: str = "all") -> list[dict[str, Any]]: ...
     def list_pr_comments(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]: ...
     def get_ci_status(self, owner: str, repo: str, sha: str) -> dict[str, Any]: ...
     def post_comment(self, owner: str, repo: str, number: int, body: str) -> dict[str, Any]: ...
@@ -76,6 +77,17 @@ class GitHubClient:
 
     def get_repo(self, owner: str, repo: str) -> dict[str, Any]:
         return self._request("GET", f"/repos/{owner}/{repo}")
+
+    def get_authenticated_user(self) -> dict[str, Any]:
+        return self._request("GET", "/user")
+
+    def can_push(self, owner: str, repo: str) -> bool:
+        """Best-effort: whether the credential may push to this repository."""
+        try:
+            data = self.get_repo(owner, repo)
+        except Exception:
+            return False
+        return bool((data.get("permissions") or {}).get("push"))
 
     def get_file(self, owner: str, repo: str, path: str, ref: str = "HEAD") -> str | None:
         try:
@@ -126,6 +138,65 @@ class GitHubClient:
             return data if isinstance(data, list) else []
         except RuntimeError:
             return []
+
+    def list_pull_requests(self, owner: str, repo: str, *, head: str = "", state: str = "all") -> list[dict[str, Any]]:
+        """List PRs, optionally filtered by head (``owner:branch`` or ``branch``)."""
+        params: dict[str, Any] = {"state": state, "per_page": 100}
+        if head:
+            params["head"] = head
+        try:
+            data = self._request("GET", f"/repos/{owner}/{repo}/pulls", params=params)
+            return data if isinstance(data, list) else []
+        except RuntimeError:
+            return []
+
+    def get_branch_required_checks(self, owner: str, repo: str, branch: str) -> list[str]:
+        """Best-effort required check contexts from branch protection.
+
+        Requires admin on most repositories; absence is not an error — callers
+        treat the checks as informational.
+        """
+        names: list[str] = []
+        try:
+            data = self._request("GET", f"/repos/{owner}/{repo}/branches/{branch}/protection")
+        except RuntimeError:
+            return names
+        if not isinstance(data, dict):
+            return names
+        contexts = ((data.get("required_status_checks") or {}).get("contexts")) or []
+        if isinstance(contexts, list):
+            names.extend(str(c) for c in contexts)
+        for check in ((data.get("required_status_checks") or {}).get("checks")) or []:
+            if isinstance(check, dict) and check.get("context"):
+                names.append(str(check["context"]))
+        return sorted(set(names))
+
+    def get_check_run(self, owner: str, repo: str, check_run_id: int | str) -> dict[str, Any]:
+        try:
+            data = self._request("GET", f"/repos/{owner}/{repo}/check-runs/{check_run_id}")
+            return data if isinstance(data, dict) else {}
+        except RuntimeError:
+            return {}
+
+    def get_actions_job_logs(self, owner: str, repo: str, job_id: int | str, *, max_bytes: int = 200_000) -> str:
+        """Best-effort Actions job log text (follows the 302 to the log blob)."""
+        url = f"{self.api_base}/repos/{owner}/{repo}/actions/jobs/{job_id}/logs"
+        try:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as c:
+                r = c.get(url, headers=self._headers())
+            if r.status_code >= 400:
+                return ""
+            return r.text[-max_bytes:]
+        except httpx.HTTPError:
+            return ""
+
+    def rerun_actions_run(self, owner: str, repo: str, run_id: int | str) -> bool:
+        """Best-effort bounded retry of a failed Actions workflow run."""
+        try:
+            self._request("POST", f"/repos/{owner}/{repo}/actions/runs/{run_id}/rerun")
+            return True
+        except RuntimeError:
+            return False
 
     def list_review_comments(self, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
         try:

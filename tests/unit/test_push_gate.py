@@ -126,6 +126,19 @@ def test_gate_rejects_wrong_repo(tmp_path):
     assert not _gate(_job(ws), ws, _settings(tmp_path), expected_repo="other/repo").allowed
 
 
+def test_gate_passes_for_committed_branch_on_resume(tmp_path):
+    """A resumed job whose change is already committed must still pass the gate."""
+    ws = _git_repo(tmp_path / "ws" / "job-1")
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-m", "fix"], check=True, capture_output=True)
+    job = _job(ws)
+    job.commit_sha = subprocess.run(
+        ["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    res = _gate(job, ws, _settings(tmp_path))
+    assert res.allowed, res.reasons
+
+
 def test_gate_rejects_unexpected_secret_file(tmp_path):
     ws = _git_repo(tmp_path / "ws" / "job-1")
     (ws / ".env").write_text("SECRET=1\n")

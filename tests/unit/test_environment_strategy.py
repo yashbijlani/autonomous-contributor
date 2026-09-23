@@ -34,8 +34,12 @@ def test_ci_code_failure():
     assert classify_ci_failure(_ci(["unit tests"])) == CIFailureClass.CODE_FAILURE
 
 
+def test_ci_dependency_failure():
+    assert classify_ci_failure(_ci(["setup-python missing dependency"])) == CIFailureClass.DEPENDENCY_FAILURE
+
+
 def test_ci_environment_failure():
-    assert classify_ci_failure(_ci(["setup-python missing dependency"])) == CIFailureClass.ENVIRONMENT_FAILURE
+    assert classify_ci_failure(_ci(["workspace toolchain missing"])) == CIFailureClass.ENVIRONMENT_FAILURE
 
 
 def test_ci_infrastructure_failure():

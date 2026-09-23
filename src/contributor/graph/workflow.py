@@ -12,6 +12,8 @@ from contributor.graph.nodes import WorkflowContext, _patch  # noqa
 from contributor.graph.nodes import (
     node_blocked_provider,
     node_ci_check,
+    node_ci_repair,
+    node_ci_repair_exhausted,
     node_create_pr,
     node_debug,
     node_env_incompatible,
@@ -21,6 +23,7 @@ from contributor.graph.nodes import (
     node_fetch_issue,
     node_finalize_benchmark,
     node_implement,
+    node_merge_ready,
     node_plan,
     node_prepare_workspace,
     node_resource_incompatible,
@@ -36,7 +39,7 @@ from contributor.observability import events
 from contributor.observability.events import emit
 
 
-def build_graph(ctx: WorkflowContext):
+def build_graph(ctx: WorkflowContext, entry: str = "fetch"):
     g = StateGraph(GraphState)
 
     def wrap(fn):
@@ -53,6 +56,9 @@ def build_graph(ctx: WorkflowContext):
     g.add_node("debug", wrap(node_debug))
     g.add_node("create_pr", wrap(node_create_pr))
     g.add_node("ci_check", wrap(node_ci_check))
+    g.add_node("ci_repair", wrap(node_ci_repair))
+    g.add_node("ci_repair_exhausted", wrap(node_ci_repair_exhausted))
+    g.add_node("merge_ready", wrap(node_merge_ready))
     g.add_node("update_pr", wrap(node_update_pr))
     g.add_node("wait", wrap(node_wait_review))
     g.add_node("escalate", wrap(node_escalate))
@@ -62,7 +68,7 @@ def build_graph(ctx: WorkflowContext):
     g.add_node("environment_failure", wrap(node_environment_failure))
     g.add_node("blocked_provider", wrap(node_blocked_provider))
 
-    g.set_entry_point("fetch")
+    g.set_entry_point(entry)
     g.add_edge("fetch", "triage")
     g.add_conditional_edges("triage", routing.after_triage,
                             {"env_discovery": "env_discovery", "escalate": "escalate"})
@@ -108,9 +114,14 @@ def build_graph(ctx: WorkflowContext):
     g.add_conditional_edges(
         "ci_check",
         lambda s: routing.after_ci(s, ctx.settings),
-        {"debug": "debug", "wait_for_review": "wait", "escalate": "escalate",
-         "environment_failure": "environment_failure"},
+        {"merge_ready": "merge_ready", "ci_repair": "ci_repair",
+         "ci_repair_exhausted": "ci_repair_exhausted",
+         "escalate": "escalate", "environment_failure": "environment_failure",
+         "__end__": END},
     )
+    g.add_edge("ci_repair", "test")
+    g.add_edge("ci_repair_exhausted", END)
+    g.add_edge("merge_ready", END)
     g.add_edge("update_pr", "ci_check")
     g.add_conditional_edges("wait", routing.after_wait, {"implement": "implement", "__end__": END})
     g.add_edge("escalate", END)
@@ -126,9 +137,50 @@ def initial_state_for_job(job: JobState) -> dict[str, Any]:
     return job.model_dump(mode="python")
 
 
-def run_to_completion(ctx: WorkflowContext, job: JobState, *, max_steps: int = 60) -> JobState:
+# Persisted state -> graph entry node, so an interrupted job resumes at the
+# right place without re-running implementation or creating a second PR.
+_RESUME_ENTRY: dict[JobStatus, str] = {
+    JobStatus.CREATED: "fetch",
+    JobStatus.DISCOVER: "fetch",
+    JobStatus.TRIAGE: "fetch",
+    JobStatus.ENVIRONMENT_DISCOVERY: "plan",
+    JobStatus.PLAN: "plan",
+    JobStatus.PREPARE_WORKSPACE: "prepare",
+    JobStatus.IMPLEMENT: "implement",
+    JobStatus.DEBUG: "debug",
+    JobStatus.TEST: "test",
+    JobStatus.REVIEW: "review",
+    JobStatus.CREATE_PR: "create_pr",
+    JobStatus.PR_CREATE_PENDING: "create_pr",
+    JobStatus.PR_CREATE_FAILED: "create_pr",
+    JobStatus.PUSHED: "create_pr",
+    JobStatus.PUSH_GATE_REJECTED: "create_pr",
+    JobStatus.UPDATE_PR: "create_pr",
+    JobStatus.CI_REPAIRED: "ci_check",
+    JobStatus.PR_OPEN: "ci_check",
+    JobStatus.PR_CI_CHECK: "ci_check",
+    JobStatus.CI_PENDING: "ci_check",
+    JobStatus.CI_RUNNING: "ci_check",
+    JobStatus.CI_PASSED: "ci_check",
+    JobStatus.CI_FAILED: "ci_check",
+    JobStatus.CI_UNKNOWN: "ci_check",
+    JobStatus.CI_REPAIRING: "ci_repair",
+    JobStatus.CI_REPAIR_EXHAUSTED: "ci_check",
+    JobStatus.MERGE_READY: "ci_check",
+    JobStatus.WAIT_FOR_REVIEW: "wait",
+}
+
+
+def resume_entry(state: JobState) -> str:
+    """Node to resume an interrupted job from (never re-runs from scratch)."""
+    return _RESUME_ENTRY.get(state.current_state, "fetch")
+
+
+def run_to_completion(
+    ctx: WorkflowContext, job: JobState, *, max_steps: int = 60, entry: str = "fetch"
+) -> JobState:
     """Execute the compiled graph with a step cap (hard limit on agent loops)."""
-    app = build_graph(ctx)
+    app = build_graph(ctx, entry=entry)
     state = initial_state_for_job(job)
     # stream with recursion limit; each node persists incrementally so resume works
     try:

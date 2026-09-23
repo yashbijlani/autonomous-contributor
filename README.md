@@ -20,9 +20,30 @@ contributor issue OWNER/REPO#123
 
 ## Workflow
 
-DISCOVER → TRIAGE → PLAN → PREPARE_WORKSPACE → IMPLEMENT → TEST → REVIEW
-→ CREATE_PR → PR_CI_CHECK → WAIT_FOR_REVIEW, with bounded DEBUG/repair loops
-and HUMAN_REQUIRED → ESCALATE.
+```
+DISCOVER → TRIAGE → ENVIRONMENT_DISCOVERY → PLAN → PREPARE_WORKSPACE → IMPLEMENT
+→ TEST (targeted) → REVIEW → push gate → COMMIT → PUSH → verify remote ref
+→ create/reuse PR → CI monitor
+   ├─ CI pass / no checks → MERGE_READY (STOP; never auto-merge)
+   ├─ repairable CI failure → CI_REPAIRING → TEST → REVIEW → push gate → repair
+   │                          commit → PUSH → update PR → CI monitor …
+   └─ infra/env failure → ESCALATE / ENVIRONMENT_FAILURE · exhausted → CI_REPAIR_EXHAUSTED
+```
+
+Bounded `DEBUG`/repair loops, human escalation, and resumable persisted state.
+
+## Modes
+
+- **benchmark** — implement/test/review only; cannot mutate GitHub.
+- **live branch** — `contributor live OWNER/REPO#N --push-repo FORK/REPO` pushes a branch.
+- **live PR** — add `--pr` to open a PR and monitor CI; bounded CI repair; never merges.
+
+```bash
+contributor live OWNER/REPO#123 --pr --push-repo FORK/REPO
+contributor metrics            # PR/CI lifecycle rates
+contributor resume JOB_ID      # continue an interrupted job
+```
+
 
 ## Layout
 

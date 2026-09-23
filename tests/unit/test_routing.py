@@ -60,6 +60,6 @@ def test_after_review_changes_required_loops_then_escalates():
 
 
 def test_after_ci():
-    assert routing.after_ci(_s(ci_result={"state": "fail"})) == "debug"
-    assert routing.after_ci(_s(ci_result={"state": "pass"})) == "wait_for_review"
-    assert routing.after_ci(_s(ci_result={"state": "unknown"})) == "wait_for_review"
+    assert routing.after_ci(_s(ci_result={"state": "fail"})) == "ci_repair"
+    assert routing.after_ci(_s(ci_result={"state": "pass"})) == "merge_ready"
+    assert routing.after_ci(_s(ci_result={"state": "unknown"})) == "merge_ready"

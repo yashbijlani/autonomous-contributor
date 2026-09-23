@@ -30,7 +30,7 @@ from contributor.execution.tests import TestRunner
 from contributor.github.ci import fetch_ci, interpret_ci
 from contributor.github.client import GitHubClient
 from contributor.github.issues import fetch_issue, normalize_issue
-from contributor.github.pull_requests import create_pr_for_job, render_pr_body, update_pr_body
+from contributor.github.pull_requests import publish_pr, render_pr_body, render_pr_title, update_pr_body
 from contributor.models.state import (
     CIResult,
     ImplementationPlan,
@@ -65,6 +65,10 @@ class WorkflowContext:
     allow_create_pr: bool = False
     allow_comments: bool = False
     allow_labels: bool = False
+    # Live PR mode: monitor GitHub checks after the PR is opened.
+    ci_monitor: bool = False
+    # Recorded only; automatic merging is never performed in this milestone.
+    auto_merge: bool = False
     push_repo: str = ""  # OWNER/REPO target; empty => issue repository
     push_remote: str = "origin"
 
@@ -379,7 +383,13 @@ def node_prepare_workspace(state: dict, ctx: WorkflowContext) -> dict:
             _sh2.rmtree(tmp, ignore_errors=True)
         branch = make_branch_name(st.job_id, st.issue_number)
         st.branch_name = branch
-        cr = checkout_new_branch(ws, branch)
+        # Idempotent on resume: reuse the branch if it already exists.
+        from contributor.execution.git import branch_exists, checkout_branch
+
+        if branch_exists(ws, branch):
+            cr = checkout_branch(ws, branch)
+        else:
+            cr = checkout_new_branch(ws, branch)
         if cr.exit_code != 0:
             raise RuntimeError(f"branch checkout failed: {cr.stderr[-500:]}")
         from contributor.execution.git import block_push, ensure_scratch_dir
@@ -665,24 +675,107 @@ def node_debug(state: dict, ctx: WorkflowContext) -> dict:
     return _patch(st)
 
 
-def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
-    """Publish a contribution: commit -> deterministic gate -> orchestrator push.
+def _push_url(token: str, target: str) -> str:
+    return f"https://x-access-token:{token}@github.com/{target}.git"
 
-    Benchmark mode is hard-blocked. The optional PR step is only attempted when
-    the live mode explicitly permits it; the first live mutation is push-only.
+
+def _verify_remote_ref(st: JobState, ctx: WorkflowContext, url: str) -> bool:
+    """Confirm the pushed branch exists on the remote at the expected commit.
+
+    A PR is never created unless this succeeds.
     """
-    from contributor.execution.git import (
-        diff_full as _d,
-        has_changes as _hc,
-        head_sha,
-        log_last,
-    )
+    if not ctx.settings.ci_verify_remote:
+        st.remote_ref_verified = True
+        st.remote_ref_sha = st.commit_sha
+        return True
+    from contributor.execution.git import remote_ref_sha
+
+    sha = remote_ref_sha(url, st.branch_name)
+    st.remote_ref_sha = sha
+    if not sha or (st.commit_sha and sha != st.commit_sha):
+        st.remote_ref_verified = False
+        reason = (
+            f"remote ref refs/heads/{st.branch_name} not found"
+            if not sha
+            else f"remote {sha[:12]} != pushed {st.commit_sha[:12]}"
+        )
+        emit(st, events.REMOTE_REF_UNVERIFIED, reason,
+             data={"expected": st.commit_sha, "remote": sha})
+        return False
+    st.remote_ref_verified = True
+    emit(st, events.REMOTE_REF_VERIFIED, f"{st.branch_name} @ {sha[:12]}",
+         data={"sha": sha})
+    return True
+
+
+def _open_or_update_pr(st: JobState, ctx: WorkflowContext, ws: Path) -> bool:
+    """Create/reuse the PR after a verified push. Returns True on success."""
+    from contributor.execution.git import working_tree_files
+
+    changed = [f for f in working_tree_files(ws) if not f.startswith(".contributor")]
+    if not changed and st.commit_sha:
+        from contributor.execution.commands import run_command
+
+        r = run_command(
+            ["git", "-C", str(ws), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            timeout=30,
+        )
+        if r.ok:
+            changed = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    base = ""
+    if isinstance(st.issue_metadata, dict):
+        base = str(st.issue_metadata.get("default_branch", "") or "")
+    base = base or "main"
+    emit(st, events.PR_CREATE_STARTED,
+         f"PR -> {st.repository} base={base} head={ctx.push_repo or st.repository}")
+    try:
+        data, action, target = publish_pr(
+            ctx.github, st, ctx.settings,
+            push_target=ctx.push_repo or st.repository,
+            base_branch=base, changed_files=changed,
+        )
+    except Exception as e:
+        st.errors.append(f"PR creation failed after push: {e}")
+        st.current_state = JobStatus.PR_CREATE_FAILED
+        st.escalated = True
+        st.human_escalation_reason = f"PR creation failed after push: {e}"
+        emit(st, events.PR_CREATE_FAILED, st.human_escalation_reason)
+        st.done = True
+        return False
+    if not st.pull_request_url or not st.pull_request_number:
+        # The API did not actually return a PR: never claim PR_OPEN.
+        st.current_state = JobStatus.PR_CREATE_FAILED
+        st.escalated = True
+        st.human_escalation_reason = "PR API returned no url/number"
+        emit(st, events.PR_CREATE_FAILED, st.human_escalation_reason, data={"response": data})
+        st.done = True
+        return False
+    st.current_state = JobStatus.PR_OPEN
+    st.merge_ready = False
+    ev = events.PR_REUSED if (st.pr_reused or action == "reused") else events.PR_OPENED
+    emit(st, ev, f"{action} {st.pull_request_url}",
+         data={"number": st.pull_request_number, "head": target.head_ref,
+               "base": target.base_branch, "reused": st.pr_reused})
+    return True
+
+
+def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
+    """Publish a contribution: gate -> commit -> push -> verify ref -> PR.
+
+    Benchmark mode is hard-blocked. The branch is pushed before any PR is
+    attempted, and the PR is never created unless the remote ref is verified.
+    """
+    from contributor.execution.git import has_changes as _hc, head_sha, log_last
     from contributor.execution.push_gate import run_push_gate
     from contributor.execution.git import push_to_target
 
     st = _load(ctx, state)
     st.current_state = JobStatus.CREATE_PR
     st.execution_mode = ctx.execution_mode
+    st.allow_push = ctx.allow_push
+    st.allow_create_pr = ctx.allow_create_pr
+    st.ci_monitor = ctx.ci_monitor
+    st.auto_merge = ctx.auto_merge
 
     if ctx.benchmark_mode:
         st.errors.append("benchmark mode forbids any GitHub mutation")
@@ -698,6 +791,7 @@ def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
     target = ctx.push_repo or st.repository
     st.push_target = target
     st.push_remote = ctx.push_remote
+    st.auto_merge = bool(ctx.auto_merge)
 
     # 1. hard deterministic gate on the uncommitted contribution.
     gate = run_push_gate(
@@ -752,7 +846,7 @@ def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
         _save(ctx, st)
         return _patch(st)
 
-    url = f"https://x-access-token:{token}@github.com/{target}.git"
+    url = _push_url(token, target)
     emit(st, events.PUSH_STARTED, f"pushing {st.branch_name} -> {target}")
     pushed = push_to_target(ws, st.branch_name, url=url)
     st.push_result = {
@@ -776,20 +870,24 @@ def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
         return _patch(st)
 
     emit(st, events.PUSHED, f"{target} {st.branch_name} {st.commit_sha[:12]}", data=st.push_result)
+
+    # 4. verify the remote ref BEFORE any PR can be created.
+    if not _verify_remote_ref(st, ctx, url):
+        st.current_state = JobStatus.PUSH_UNVERIFIED
+        st.escalated = True
+        st.human_escalation_reason = "pushed branch could not be verified on the remote"
+        st.errors.append(st.human_escalation_reason)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    # 5. PR (live PR mode only).
     if ctx.allow_create_pr:
-        try:
-            base = st.issue_metadata.get("default_branch", "main")
-            data = create_pr_for_job(ctx.github, st, ctx.settings, base=base)
-            st.pull_request_url = data.get("html_url", "")
-            st.pull_request_number = int(data.get("number", 0) or 0)
-            emit(st, events.PR_CREATED, st.pull_request_url)
-            st.current_state = JobStatus.PR_CI_CHECK
-        except Exception as e:
-            st.errors.append(f"PR creation failed after push: {e}")
-            st.current_state = JobStatus.ESCALATE
-            st.escalated = True
-            st.human_escalation_reason = f"PR creation failed after push: {e}"
+        ok = _open_or_update_pr(st, ctx, ws)
+        if not ok:
             st.done = True
+        elif not ctx.ci_monitor:
+            st.done = True  # PR opened; CI monitoring disabled in this mode
     else:
         st.current_state = JobStatus.PUSHED
         st.human_escalation_reason = ""
@@ -798,89 +896,411 @@ def node_create_pr(state: dict, ctx: WorkflowContext) -> dict:
     return _patch(st)
 
 
-def node_ci_check(state: dict, ctx: WorkflowContext) -> dict:
-    st = _load(ctx, state)
-    st.current_state = JobStatus.PR_CI_CHECK
+def _ensure_session(st: JobState, ctx: WorkflowContext, ws: Path):
+    """Return a live sandbox session, re-provisioning deterministically if the
+    process restarted since the session was created."""
+    if ctx.sessions is None:
+        return None
+    session = ctx.sessions.get(st.job_id)
+    if session is not None:
+        return session
+    if not (ctx.settings.sandbox_execution and ctx.sandbox.use_docker):
+        return None
+    if not _provision_environment(st, ctx, ws):
+        return None
+    return ctx.sessions.get(st.job_id)
+
+
+def _reproduce_ci(st: JobState, ctx: WorkflowContext, ws: Path, session) -> dict | None:
+    """Try to reproduce the CI failure locally with the narrowest test."""
     try:
-        owner, repo = st.repository.split("/", 1)
-        # resolve head sha via PR info
-        sha = ""
-        try:
-            from contributor.execution.commands import run_command as _rc
+        from contributor.execution.git import working_tree_files
+        from contributor.execution.tests import TestRunner
 
-            ws = Path(st.workspace_path)
-            r = _rc(["git", "-C", str(ws), "rev-parse", "HEAD"], timeout=15)
-            sha = r.stdout.strip()
-        except Exception:
-            pass
-        if sha:
-            ci = fetch_ci(ctx.github, owner, repo, sha)
-        else:
-            ci = CIResult(state="unknown", summary="no sha")
-        st.ci_result = ci
-        if ci.state == "pass":
-            emit(st, events.CI_PASSED, ci.summary)
-            st.current_state = JobStatus.WAIT_FOR_REVIEW
-        elif ci.state == "pending":
-            emit(st, events.CI_PASSED, f"CI pending: {ci.summary}")
-            st.current_state = JobStatus.WAIT_FOR_REVIEW
-        elif ci.state == "unknown":
-            emit(st, events.CI_PASSED, "CI unknown (no checks); proceeding to review gate")
-            st.current_state = JobStatus.WAIT_FOR_REVIEW
-        else:
-            from contributor.github.ci import classify_ci_failure
-
-            cls = classify_ci_failure(ci, st.environment_report)
-            st.ci_failure_class = cls
-            st.ci_repair_attempt += 1
-            emit(st, events.CI_CLASSIFIED, f"CI failed: class={cls.value} {ci.summary}", data={"class": cls.value})
-            if cls.value == "environment_failure":
-                st.current_state = JobStatus.ENVIRONMENT_FAILURE
-            elif cls.value == "ci_infrastructure_failure":
-                st.current_state = JobStatus.ESCALATE
-                st.escalated = True
-                st.human_escalation_reason = f"CI infrastructure failure (not a code failure): {ci.summary}"
-            else:
-                st.current_state = JobStatus.DEBUG
+        changed = working_tree_files(ws)
+        likely = st.plan.files_expected_to_change if st.plan else []
+        runner = TestRunner(ctx.sandbox, test_timeout_s=ctx.settings.test_timeout_s, session=session)
+        tr = runner.run_targeted(ws, changed_files=changed, likely_files=likely)
+        if tr is None:
+            return {"reproduced": False, "reason": "no targeted command derivable"}
+        st.test_results.append(tr)
+        result = {
+            "command": tr.command,
+            "passed": tr.passed,
+            "exit_code": tr.exit_code,
+            "reproduced": not tr.passed,
+            "failures": tr.failures[:5],
+        }
+        emit(st, events.CI_REPRODUCED,
+             f"local repro `{tr.command}` exit={tr.exit_code} reproduced={not tr.passed}",
+             data=result)
+        return result
     except Exception as e:
-        st.errors.append(f"ci check failed: {e}")
-        st.current_state = JobStatus.WAIT_FOR_REVIEW
+        return {"reproduced": False, "reason": str(e)[:200]}
+
+
+def _attempt_ci_retry(st: JobState, ctx: WorkflowContext, owner: str, repo: str, ci) -> bool:
+    """Bounded, code-free retry for flaky/infrastructure CI. Never repairs."""
+    from contributor.github.ci import actions_run_id_from_url
+
+    if st.ci_retry_count >= ctx.settings.ci_flaky_retries:
+        return False
+    run_ids = {
+        actions_run_id_from_url(c.get("details_url") or c.get("url") or "")
+        for c in ci.checks
+        if c.get("state") == "fail"
+    }
+    run_ids.discard("")
+    if not run_ids or not hasattr(ctx.github, "rerun_actions_run"):
+        return False
+    requested = False
+    for rid in sorted(run_ids):
+        if ctx.github.rerun_actions_run(owner, repo, rid):
+            requested = True
+    if requested:
+        st.ci_retry_count += 1
+        emit(st, events.CI_RETRY_REQUESTED,
+             f"requested CI rerun (attempt {st.ci_retry_count})", data={"run_ids": sorted(run_ids)})
+    return requested
+
+
+def node_ci_check(state: dict, ctx: WorkflowContext) -> dict:
+    """Bounded CI monitoring: fetch normalized checks, classify failures.
+
+    The verdict comes from GitHub check states, never from the model.
+    """
+    from contributor.github.ci import (
+        apply_required,
+        classify_with_diagnosis,
+        interpret_ci,
+        watch_ci,
+    )
+    from contributor.execution.git import head_sha
+
+    st = _load(ctx, state)
+    st.current_state = JobStatus.CI_PENDING
+    ws = Path(st.workspace_path) if st.workspace_path else Path(".")
+    sha = st.commit_sha or head_sha(ws)
+    if not st.repository or "/" not in st.repository or not sha:
+        st.current_state = JobStatus.CI_UNKNOWN
+        st.ci_result = CIResult(state="unknown", summary="missing repo or sha")
+        emit(st, events.CI_UNKNOWN, "cannot query CI (missing repo/sha)")
+        _save(ctx, st)
+        return _patch(st)
+    owner, repo = st.repository.split("/", 1)
+    required: list[str] = []
+    if hasattr(ctx.github, "get_branch_required_checks"):
+        try:
+            required = ctx.github.get_branch_required_checks(
+                owner, repo, str(st.issue_metadata.get("default_branch", "") or "")
+            )
+        except Exception:
+            required = []
+
+    emit(st, events.CI_PENDING, f"monitoring checks for {sha[:12]}")
+    # Persist an explicit pending/running state before the (bounded) wait so an
+    # interrupt can resume from the real phase.
+    try:
+        pre = apply_required(interpret_ci(ctx.github.get_ci_status(owner, repo, sha)), required)
+        st.ci_checks, st.ci_result, st.ci_polls = pre.checks, pre, 1
+        if pre.phase == "in_progress":
+            st.current_state = JobStatus.CI_RUNNING
+            emit(st, events.CI_RUNNING, pre.summary)
+        _save(ctx, st)
+    except Exception:
+        pass
+
+    # Bounded poll; re-run once per bounded flaky/infra retry.
+    while True:
+        try:
+            ci = watch_ci(
+                ctx.github, owner, repo, sha,
+                interval_s=ctx.settings.ci_poll_interval_s,
+                max_wait_s=ctx.settings.ci_max_wait_s,
+                settle_s=ctx.settings.ci_settle_s,
+            )
+        except Exception as e:
+            st.errors.append(f"ci check failed: {e}")
+            st.current_state = JobStatus.CI_UNKNOWN
+            st.ci_result = CIResult(state="unknown", summary=str(e)[:200])
+            st.done = True
+            _save(ctx, st)
+            return _patch(st)
+        ci = apply_required(ci, required)
+        st.ci_checks, st.ci_result = ci.checks, ci
+        st.ci_polls += ci.polls
+        st.ci_wait_s = round(st.ci_wait_s + ci.waited_s, 1)
+        if ci.timed_out:
+            st.current_state = JobStatus.CI_FAILED
+            from contributor.models.state import CIFailureClass
+
+            st.ci_failure_class = CIFailureClass.CI_INFRASTRUCTURE_FAILURE
+            st.human_escalation_reason = (
+                f"CI did not complete within {ctx.settings.ci_max_wait_s}s "
+                f"(polls={st.ci_polls}, checks={len(ci.checks)})."
+            )
+            emit(st, events.CI_TIMED_OUT, st.human_escalation_reason)
+            break
+        if ci.state == "pass":
+            st.current_state = JobStatus.CI_PASSED
+            st.human_escalation_reason = ""
+            emit(st, events.CI_PASSED, ci.summary)
+            break
+        if ci.state == "unknown":
+            st.current_state = JobStatus.CI_UNKNOWN
+            st.human_escalation_reason = (
+                "No GitHub CI checks were reported for this commit."
+            )
+            emit(st, events.CI_UNKNOWN, st.human_escalation_reason)
+            break
+        # failure: classify deterministically, then decide.
+        cls, diag, raw = classify_with_diagnosis(
+            ctx.github, owner, repo, ci, st.environment_report
+        )
+        st.ci_failure_class = cls
+        st.ci_diagnosis = diag
+        st.ci_raw_ref = raw
+        st.current_state = JobStatus.CI_FAILED
+        emit(st, events.CI_FAILED, f"class={cls.value} {ci.summary}", data={"class": cls.value})
+        emit(st, events.CI_FAILURE_CLASSIFIED,
+             f"{cls.value} repairable={cls.repairable}",
+             data={"class": cls.value, "repairable": cls.repairable})
+        if cls.repairable:
+            break
+        if _attempt_ci_retry(st, ctx, owner, repo, ci):
+            _save(ctx, st)
+            continue
+        break
     _save(ctx, st)
     return _patch(st)
 
 
+def node_ci_repair(state: dict, ctx: WorkflowContext) -> dict:
+    """Bounded CI repair: reproduce locally, ask OpenCode for the smallest fix.
+
+    The repair then flows through the existing test -> review -> publish loop,
+    which re-applies the deterministic push gate and updates the same PR.
+    """
+    from contributor.agents.ci_repair import run_ci_repair
+
+    st = _load(ctx, state)
+    st.ci_repair_attempt += 1
+    st.current_state = JobStatus.CI_REPAIRING
+    kind = st.ci_failure_class.value if st.ci_failure_class else "unknown"
+    emit(st, events.REPAIR_STARTED,
+         f"CI repair attempt {st.ci_repair_attempt} ({kind})",
+         agent="ci_repair", attempt=st.ci_repair_attempt,
+         data={"class": kind})
+    ws = Path(st.workspace_path) if st.workspace_path else None
+    if ws is None or not ws.exists():
+        st.errors.append("CI repair: workspace missing")
+        st.current_state = JobStatus.ENVIRONMENT_FAILURE
+        st.escalated = True
+        st.human_escalation_reason = "CI repair requires the contribution workspace, which is gone."
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    session = _ensure_session(st, ctx, ws)
+    if (
+        session is None
+        and ctx.sessions is not None
+        and ctx.settings.sandbox_execution
+        and ctx.sandbox.use_docker
+    ):
+        st.errors.append("CI repair: sandbox session unavailable")
+        st.current_state = JobStatus.ENVIRONMENT_FAILURE
+        st.escalated = True
+        st.human_escalation_reason = "CI repair could not provision a sandbox session."
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    # 1. reproduce the failure locally (narrowest test), before the repair.
+    _reproduce_ci(st, ctx, ws, session)
+
+    # 2. run the bounded repair agent in the SAME sandbox/repository.
+    try:
+        result = run_ci_repair(
+            st, ctx.settings, _runner_for(st, ctx), health_store=ctx.health,
+        )
+        emit(st, events.REPAIR_COMPLETE,
+             f"repair exit={result.code} kind={result.error_kind or '-'}",
+             agent="ci_repair", attempt=st.ci_repair_attempt,
+             data={"exit_code": result.code, "error_kind": result.error_kind})
+        _record_agent_usage(ctx, st, "ci_repair", result, st.ci_repair_attempt)
+        blocked = _handle_opencode_failure(
+            st, result.code, result.stderr, result.error_kind, agent="ci_repair"
+        )
+        if blocked:
+            st.ci_repair_attempt = max(0, st.ci_repair_attempt - 1)
+    except Exception as e:
+        st.errors.append(f"ci repair failed: {e}")
+        emit(st, events.JOB_FAILED, f"ci repair error: {e}", agent="ci_repair")
+    st.current_state = JobStatus.TEST
+    _save(ctx, st)
+    return _patch(st)
+
+
+def node_ci_repair_exhausted(state: dict, ctx: WorkflowContext) -> dict:
+    st = _load(ctx, state)
+    st.current_state = JobStatus.CI_REPAIR_EXHAUSTED
+    st.escalated = True
+    kind = st.ci_failure_class.value if st.ci_failure_class else "unknown"
+    st.human_escalation_reason = (
+        f"CI still failing after {st.ci_repair_attempt} repair attempt(s) "
+        f"(last class={kind}). Check count={len(st.ci_checks)}."
+    )
+    emit(st, events.CI_REPAIR_EXHAUSTED, st.human_escalation_reason)
+    st.done = True
+    _save(ctx, st)
+    return _patch(st)
+
+
+def node_merge_ready(state: dict, ctx: WorkflowContext) -> dict:
+    """Terminal: CI passed (or the repo exposes no checks). NEVER merges."""
+    st = _load(ctx, state)
+    st.current_state = JobStatus.MERGE_READY
+    st.merge_ready = True
+    st.done = True
+    if st.ci_result and st.ci_result.state == "pass":
+        emit(st, events.MERGE_READY,
+             f"PR {st.pull_request_url} ready for human merge (CI passed)",
+             data={"ci_state": st.ci_result.state, "checks": len(st.ci_result.checks)})
+    else:
+        emit(st, events.MERGE_READY,
+             f"PR {st.pull_request_url} ready for human merge (no CI checks reported)",
+             data={"ci_state": st.ci_result.state if st.ci_result else "unknown"})
+    _save(ctx, st)
+    return _patch(st)
+
+
+
 def node_update_pr(state: dict, ctx: WorkflowContext) -> dict:
+    """Republish after a CI repair: gate -> one repair commit -> push -> update PR.
+
+    Reuses the same branch and the same PR (never creates a duplicate), and
+    re-applies the deterministic gate before the push.
+    """
+    from contributor.execution.git import has_changes as _hc, head_sha
+    from contributor.execution.push_gate import run_push_gate
+    from contributor.execution.git import push_to_target
+
     st = _load(ctx, state)
     st.current_state = JobStatus.UPDATE_PR
     if ctx.benchmark_mode:
         st.errors.append("benchmark mode forbids PR updates")
-        st.current_state = JobStatus.ESCALATE
+        st.current_state = JobStatus.PUSH_GATE_REJECTED
         st.escalated = True
         st.human_escalation_reason = "benchmark mode forbids PR updates"
         st.done = True
         _save(ctx, st)
         return _patch(st)
-    try:
-        ws = Path(st.workspace_path)
-        from contributor.execution.git import has_changes as _hc, commit_all as _ca, push_branch as _pb
 
-        if _hc(ws):
-            cr = _ca(ws, f"Address review feedback for #{st.issue_number}")
-            if cr.exit_code != 0:
-                raise RuntimeError(f"commit failed: {cr.stderr[-500:]}")
-            pr = _pb(ws, st.branch_name)
-            if pr.exit_code != 0:
-                raise RuntimeError(f"push failed: {pr.stderr[-500:]}")
-        owner, repo = st.repository.split("/", 1)
-        ctx.github.update_pr(owner, repo, st.pull_request_number, body=render_pr_body(st, ctx.settings))
-        emit(st, events.PR_UPDATED, st.pull_request_url)
-        st.current_state = JobStatus.PR_CI_CHECK
-    except Exception as e:
-        st.errors.append(f"update_pr failed: {e}")
-        emit(st, events.JOB_FAILED, str(e))
-        st.current_state = JobStatus.ESCALATE
+    ws = Path(st.workspace_path) if st.workspace_path else Path(".")
+    target = ctx.push_repo or st.repository
+    st.push_target = target
+
+    gate = run_push_gate(
+        job=st, workspace=ws, settings=ctx.settings, allow_push=ctx.allow_push,
+        execution_mode=ctx.execution_mode, target_repo=target,
+        remote=ctx.push_remote, expected_repo=st.repository,
+    )
+    st.push_gate = gate.to_dict()
+    if not gate.allowed:
+        st.current_state = JobStatus.PUSH_GATE_REJECTED
         st.escalated = True
-        st.human_escalation_reason = f"PR update failed: {e}"
+        st.human_escalation_reason = "repair push gate rejected: " + "; ".join(gate.reasons[:6])
+        st.errors.append(st.human_escalation_reason)
+        emit(st, events.PUSH_GATE_REJECTED, st.human_escalation_reason, data=st.push_gate)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+    emit(st, events.PUSH_GATE_PASSED, "deterministic push gate passed for repair", data=st.push_gate)
+
+    parent_sha = st.commit_sha
+    if _hc(ws):
+        kind = st.ci_failure_class.value if st.ci_failure_class else "ci"
+        msg = f"CI repair for #{st.issue_number} ({kind})"
+        cr = commit_all(ws, msg)
+        if cr.exit_code != 0:
+            st.errors.append(f"repair commit failed: {cr.stderr[-500:]}")
+            st.current_state = JobStatus.ESCALATE
+            st.escalated = True
+            st.human_escalation_reason = f"Repair commit failed: {cr.stderr[-300:]}"
+            _save(ctx, st)
+            return _patch(st)
+        st.commit_sha = head_sha(ws)
+        emit(st, events.REPAIR_COMMIT_CREATED, f"{st.commit_sha[:12]} {msg}",
+             data={"sha": st.commit_sha, "parent": parent_sha, "message": msg})
+    else:
+        st.errors.append("repair produced no changes; nothing to push")
+        st.current_state = JobStatus.CI_REPAIR_EXHAUSTED
+        st.escalated = True
+        st.human_escalation_reason = "CI repair produced no change; cannot resolve the failure automatically."
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    token = ctx.settings.github_token
+    if not token:
+        st.current_state = JobStatus.PUSH_FAILED
+        st.escalated = True
+        st.human_escalation_reason = "repair push failed: no GITHUB_TOKEN configured"
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+    url = _push_url(token, target)
+    pushed = push_to_target(ws, st.branch_name, url=url)
+    st.push_result = {
+        "target": target, "remote": ctx.push_remote, "branch": st.branch_name,
+        "commit_sha": st.commit_sha, "exit_code": pushed.exit_code,
+        "ok": pushed.exit_code == 0,
+        "stdout_tail": pushed.stdout[-2000:], "stderr_tail": pushed.stderr[-2000:],
+        "repair": True,
+    }
+    if pushed.exit_code != 0:
+        st.current_state = JobStatus.PUSH_FAILED
+        st.escalated = True
+        st.human_escalation_reason = f"repair push failed: {pushed.stderr[-500:]}"
+        st.errors.append(st.human_escalation_reason)
+        emit(st, events.PUSH_FAILED, st.human_escalation_reason, data=st.push_result)
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+    emit(st, events.REPAIR_PUSHED, f"{target} {st.branch_name} {st.commit_sha[:12]}",
+         data=st.push_result)
+
+    if not _verify_remote_ref(st, ctx, url):
+        st.current_state = JobStatus.PUSH_UNVERIFIED
+        st.escalated = True
+        st.human_escalation_reason = "repair push could not be verified on the remote"
+        st.done = True
+        _save(ctx, st)
+        return _patch(st)
+
+    review = st.review_result
+    st.repair_history.append({
+        "parent_sha": parent_sha,
+        "new_sha": st.commit_sha,
+        "reason": (st.ci_failure_class.value if st.ci_failure_class else "unknown"),
+        "tests": st.test_results[-1].command if st.test_results else "",
+        "tests_passed": bool(st.test_results and st.test_results[-1].passed),
+        "review": review.verdict.value if review else "",
+    })
+
+    # Update the existing PR (never create a duplicate).
+    if ctx.allow_create_pr and st.pull_request_number:
+        try:
+            publish_pr(
+                ctx.github, st, ctx.settings,
+                push_target=target,
+                base_branch=str(st.issue_metadata.get("default_branch", "") or "main"),
+            )
+            emit(st, events.PR_UPDATED, st.pull_request_url)
+        except Exception as e:
+            st.errors.append(f"PR update after repair failed: {e}")
+    st.current_state = JobStatus.CI_REPAIRED
     _save(ctx, st)
     return _patch(st)
 

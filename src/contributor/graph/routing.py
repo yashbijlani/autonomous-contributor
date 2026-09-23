@@ -112,21 +112,31 @@ def after_create_pr(state: dict) -> str:
 
 
 def after_ci(state: dict, settings: Settings | None = None) -> str:
+    """Route a CI result deterministically.
+
+    Pass / no-checks -> merge-ready (never merges). Repairable failures enter
+    the bounded CI repair loop. Infrastructure/environment failures stop.
+    """
+    if state.get("done"):
+        return "__end__"
     ci = state.get("ci_result") or {}
     s = ci.get("state", "unknown")
-    if s != "fail":
-        return "wait_for_review"
+    if s in ("pass", "unknown"):
+        return "merge_ready"
     cls = state.get("ci_failure_class") or "unknown"
     if isinstance(cls, dict):
         cls = cls.get("value", "unknown")
-    if cls == "environment_failure":
-        return "environment_failure"
-    if cls == "ci_infrastructure_failure":
+    repairable = cls in ("code_failure", "test_failure", "build_failure", "unknown")
+    if not repairable:
+        if cls in ("environment_failure", "dependency_failure"):
+            return "environment_failure"
+        # infrastructure / network / permission / resource / flaky: never chase
+        # the coding agent after an infrastructure problem.
         return "escalate"
-    max_cycles = settings.max_ci_repair_cycles if settings else 2
-    if state.get("ci_repair_attempt", 0) > max_cycles:
-        return "escalate"
-    return "debug"
+    max_cycles = settings.max_ci_repair_cycles if settings else 3
+    if state.get("ci_repair_attempt", 0) >= max_cycles:
+        return "ci_repair_exhausted"
+    return "ci_repair"
 
 
 def after_wait(state: dict) -> str:

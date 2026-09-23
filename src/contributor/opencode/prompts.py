@@ -69,3 +69,58 @@ Implement the fix now. Keep the diff minimal and run the relevant tests if quick
 
 def build_debug_prompt(state: JobState, *, failing: str = "") -> str:
     return build_implement_prompt(state, extra_context=f"\nDEBUG MODE. Failing evidence:\n{failing[:5000]}\nFix the root cause, not the symptom.")
+
+
+def _ci_repair_context(state: JobState) -> str:
+    diag = state.ci_diagnosis or {}
+    failed = diag.get("failed_checks") or []
+    error_lines = diag.get("error_lines") or []
+    jobs = diag.get("jobs") or []
+    parts = [
+        "CI REPAIR ITERATION.",
+        f"Issue: #{state.issue_number} {state.issue_title}",
+        f"PR: {state.pull_request_url or '(none)'}",
+        f"Current commit: {state.commit_sha or '(unknown)'}",
+        f"Changed files: {', '.join(c.get('file', '') for c in (diag.get('changed_files') or [])) or '(see diff)'}",
+        f"Failure classification: {state.ci_failure_class.value if state.ci_failure_class else 'unknown'}",
+    ]
+    if failed:
+        parts.append("Failed checks:")
+        for c in failed[:5]:
+            parts.append(
+                f"- {c.get('name')} [{c.get('workflow') or '-'}] "
+                f"conclusion={c.get('conclusion')} url={c.get('url')}"
+            )
+    if jobs:
+        parts.append("Failed jobs: " + ", ".join(str(j.get('check')) for j in jobs[:5]))
+    if state.ci_repair_attempt:
+        parts.append(f"Previous repair attempts: {state.ci_repair_attempt}")
+    if state.test_results:
+        last = state.test_results[-1]
+        parts.append(
+            f"Last local test: `{last.command}` exit={last.exit_code} passed={last.passed}"
+        )
+    repro = state.issue_metadata.get("ci_reproduction") if isinstance(state.issue_metadata, dict) else None
+    if repro:
+        parts.append(f"Local reproduction: {repro}")
+    if error_lines:
+        parts.append("Relevant CI log lines:")
+        parts.append("\n".join(error_lines[:40]))
+    return "\n".join(parts)
+
+
+def build_ci_repair_prompt(state: JobState, *, failing: str = "") -> str:
+    context = _ci_repair_context(state)
+    return f"""{BASE_RULES}
+{context}
+
+This is a CI repair iteration.
+Do not rewrite the implementation unnecessarily.
+Diagnose the failure first.
+Make the smallest correct change.
+Reproduce the failure locally when possible.
+Run the narrowest relevant test before broader validation.
+If the CI failure is infrastructure/environment/flaky rather than caused by
+this change, make NO code change and report that finding instead.
+{failing}
+"""

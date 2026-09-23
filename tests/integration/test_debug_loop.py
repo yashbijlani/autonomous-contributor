@@ -17,7 +17,8 @@ from contributor.persistence.database import Database
 def test_debug_loop_repairs(tmp_path: Path, monkeypatch):
     origin = init_origin_repo(tmp_path / "origin", failing=True)
     settings = Settings(database_url="sqlite:///:memory:", workspaces_root=str(tmp_path / "ws"),
-                        sandbox_fallback_local=True, require_docker=False, test_timeout_s=120)
+                        sandbox_fallback_local=True, require_docker=False, test_timeout_s=120,
+                        ci_verify_remote=False)
     db = Database(settings.database_url)
 
     calls = {"n": 0}

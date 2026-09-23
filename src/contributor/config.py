@@ -63,7 +63,7 @@ class Settings(BaseSettings):
     max_implementation_attempts: int = 3
     max_debug_attempts: int = 3
     max_review_cycles: int = 3
-    max_ci_repair_cycles: int = 2
+    max_ci_repair_cycles: int = 3
     max_concurrent_jobs: int = 2
     job_timeout_s: int = 7200
     command_timeout_s: int = 600
@@ -122,6 +122,21 @@ class Settings(BaseSettings):
         default="This PR was created with AI assistance (autonomous-contributor + OpenCode). Human review requested."
     )
     default_branch_protection: tuple[str, ...] = ("main", "master")
+    # Use the repository's PR template when one exists (never overwrite it).
+    pr_use_template: bool = True
+
+    # --- PR / CI lifecycle (live PR mode only) ---
+    # Verify the pushed ref actually exists on the remote before creating a PR.
+    ci_verify_remote: bool = True
+    # Bounded CI polling (host-side; no extra sandbox).
+    ci_poll_interval_s: int = 20
+    ci_max_wait_s: int = 1800
+    # How long to keep waiting for checks to *appear* before declaring "no checks".
+    ci_settle_s: int = 60
+    # Bounded retry of flaky/infrastructure CI before escalating (no code change).
+    ci_flaky_retries: int = 1
+    # Cap on CI log/diagnosis bytes pulled into the model context.
+    ci_log_budget_chars: int = 12000
 
     # Observability
     log_level: str = Field(default="INFO")

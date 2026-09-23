@@ -117,6 +117,17 @@ def run_push_gate(
         from contributor.execution.git import working_tree_files
 
         files = [f for f in working_tree_files(ws) if not f.startswith(".contributor")]
+        if not files and job.commit_sha:
+            # Resume path: the contribution is already committed on this branch.
+            # Gate the committed change relative to its parent, not the clean tree.
+            from contributor.execution.commands import run_command
+
+            r = run_command(
+                ["git", "-C", str(ws), "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+                timeout=30,
+            )
+            if r.ok:
+                files = [l.strip() for l in r.stdout.splitlines() if l.strip()]
     _add(checks, reasons, "source_changes_exist", bool(files), f"{len(files)} file(s)")
 
     banned = [f for f in files if _BANNED_PATH.search(f)]

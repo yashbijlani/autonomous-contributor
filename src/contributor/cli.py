@@ -31,6 +31,8 @@ def make_context(
     execution_mode: str = "benchmark",
     allow_push: bool = False,
     allow_create_pr: bool = False,
+    ci_monitor: bool = False,
+    auto_merge: bool = False,
     push_repo: str = "",
     push_remote: str = "origin",
 ) -> WorkflowContext:
@@ -46,6 +48,7 @@ def make_context(
         settings=settings, db=db, github=github, sandbox=sandbox, runner=runner,
         sessions=SandboxSessionRegistry(settings),
         execution_mode=execution_mode, allow_push=allow_push, allow_create_pr=allow_create_pr,
+        ci_monitor=ci_monitor, auto_merge=auto_merge,
         push_repo=push_repo, push_remote=push_remote,
     )
 
@@ -53,6 +56,10 @@ def make_context(
 def _create_job(ctx: WorkflowContext, ref: IssueRef) -> JobState:
     job = JobState(job_id=new_job_id(), repository=ref.full_name, issue_number=ref.number)
     job.execution_mode = ctx.execution_mode
+    job.allow_push = ctx.allow_push
+    job.allow_create_pr = ctx.allow_create_pr
+    job.ci_monitor = ctx.ci_monitor
+    job.auto_merge = ctx.auto_merge
     job.add_event("JOB_CREATED", f"Created for {ref.short} mode={ctx.execution_mode}")
     ctx.repo.save_incremental(job)
     return job
@@ -115,6 +122,7 @@ def run(
     ref: str,
     push: bool = typer.Option(False, "--push/--no-push", help="Live mode: allow orchestrator push"),
     create_pr: bool = typer.Option(False, "--pr/--no-pr", help="Live mode: also open a PR (default off)"),
+    ci: bool = typer.Option(False, "--ci/--no-ci", help="Live PR mode: monitor CI checks"),
     push_repo: str = typer.Option("", "--push-repo", help="Push target OWNER/REPO (default: issue repo)"),
     push_remote: str = typer.Option("origin", "--push-remote", help="Remote name label for the push target"),
 ):
@@ -125,13 +133,15 @@ def run(
     mode = "live" if push else "benchmark"
     ctx = make_context(
         execution_mode=mode, allow_push=push, allow_create_pr=create_pr,
+        ci_monitor=bool(create_pr and ci),
         push_repo=push_repo, push_remote=push_remote,
     )
     issue_ref = IssueRef.parse(ref)
     job = _create_job(ctx, issue_ref)
     console.print(
         f"[bold]Job {job.job_id}[/bold] for {issue_ref.short} "
-        f"mode={mode} push={push} pr={create_pr} target={push_repo or issue_ref.full_name}"
+        f"mode={mode} push={push} pr={create_pr} ci={bool(create_pr and ci)} "
+        f"target={push_repo or issue_ref.full_name}"
     )
     if not _preflight_gate(ctx, job):
         raise typer.Exit(2)
@@ -149,17 +159,23 @@ def live(
     push_repo: str = typer.Option("", "--push-repo", help="Push target OWNER/REPO (e.g. fork)"),
     push_remote: str = typer.Option("origin", "--push-remote"),
     create_pr: bool = typer.Option(False, "--pr/--no-pr"),
+    ci: bool = typer.Option(True, "--ci/--no-ci", help="Monitor CI after opening the PR"),
 ):
-    """Live contribution: implement, verify, and PUSH the branch (no PR by default)."""
+    """Live contribution: implement, verify, push, and (optionally) open a PR.
+
+    With --pr the orchestrator opens a PR and (by default) monitors CI. The
+    system never merges automatically.
+    """
     ctx = make_context(
         execution_mode="live", allow_push=True, allow_create_pr=create_pr,
+        ci_monitor=bool(create_pr and ci),
         push_repo=push_repo, push_remote=push_remote,
     )
     issue_ref = IssueRef.parse(ref)
     job = _create_job(ctx, issue_ref)
     console.print(
         f"[bold]LIVE[/bold] job={job.job_id} issue={issue_ref.short} "
-        f"target={push_repo or issue_ref.full_name}"
+        f"pr={create_pr} ci={bool(create_pr and ci)} target={push_repo or issue_ref.full_name}"
     )
     if not _preflight_gate(ctx, job):
         raise typer.Exit(2)
@@ -167,6 +183,7 @@ def live(
     console.print(
         f"Done: state={final.current_state.value} pushed="
         f"{bool(final.push_result and final.push_result.get('ok'))} "
+        f"pr={final.pull_request_url or '-'} "
         f"branch={final.branch_name or '-'} sha={final.commit_sha[:12] or '-'}"
     )
 
@@ -230,18 +247,40 @@ def logs(job_id: str, limit: int = typer.Option(50)):
 
 @app.command()
 def resume(job_id: str):
-    """Resume a job after crash/restart from persisted state."""
-    ctx = make_context()
-    st = ctx.repo.get(job_id)
+    """Resume a job after crash/restart from persisted state.
+
+    Reconstructs the live push/PR/CI mode from the persisted job so an
+    interrupted PR or CI monitor can continue without opening a second PR.
+    """
+    probe = make_context()
+    st = probe.repo.get(job_id)
     if not st:
         console.print(f"[red]Job {job_id} not found[/red]")
         raise typer.Exit(1)
     if st.done:
         console.print(f"Job already done: {st.current_state.value}")
         return
-    console.print(f"Resuming job {job_id} from {st.current_state.value}")
-    final = run_to_completion(ctx, st)
-    console.print(f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'}")
+    ctx = make_context(
+        execution_mode=st.execution_mode,
+        allow_push=st.allow_push,
+        allow_create_pr=st.allow_create_pr,
+        ci_monitor=st.ci_monitor,
+        auto_merge=st.auto_merge,
+        push_repo=st.push_target or "",
+        push_remote=st.push_remote or "origin",
+    )
+    from contributor.graph.workflow import resume_entry
+
+    entry = resume_entry(st)
+    console.print(
+        f"Resuming job {job_id} from {st.current_state.value} (entry={entry}) "
+        f"mode={st.execution_mode} pr={st.allow_create_pr} ci={st.ci_monitor}"
+    )
+    final = run_to_completion(ctx, st, entry=entry)
+    console.print(
+        f"Done: state={final.current_state.value} pr={final.pull_request_url or '-'} "
+        f"ci={final.ci_result.state if final.ci_result else '-'}"
+    )
 
 
 @app.command()
@@ -286,6 +325,19 @@ def usage(job_id: str = typer.Option("", "--job", help="Limit to one job")):
                   f"{r.get('duration_s', 0):.1f}", r.get("outcome", ""))
     console.print(t)
     console.print(_json.dumps(summarize_usage(ctx.db)))
+
+
+@app.command()
+def metrics(job_id: str = typer.Option("", "--job", help="Limit to one job")):
+    """PR/CI lifecycle metrics (rates are deterministic, from persisted facts)."""
+    from contributor.observability.metrics import aggregate_metrics, job_metrics
+    from contributor.persistence.usage import list_usage
+
+    ctx = make_context()
+    jobs = [ctx.repo.get(job_id)] if job_id else ctx.repo.list(limit=200)
+    jobs = [j for j in jobs if j is not None]
+    rows = [job_metrics(j, list_usage(ctx.db, j.job_id)) for j in jobs]
+    console.print_json(data=(rows[0] if (job_id and rows) else aggregate_metrics(rows)))
 
 
 @app.command()

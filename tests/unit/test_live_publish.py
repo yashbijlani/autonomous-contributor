@@ -37,6 +37,7 @@ def _ctx(tmp_path: Path, *, mode: str, allow_push: bool) -> tuple[WorkflowContex
         database_url="sqlite:///:memory:",
         workspaces_root=str(tmp_path / "ws"),
         github_token="tok",
+        ci_verify_remote=False,
     )
     ctx = WorkflowContext(
         settings=settings,

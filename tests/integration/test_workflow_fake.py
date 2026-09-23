@@ -22,6 +22,7 @@ def test_full_workflow_happy_path(tmp_path: Path, monkeypatch):
         sandbox_fallback_local=True,
         require_docker=False,
         test_timeout_s=120,
+        ci_verify_remote=False,
     )
     db = Database(settings.database_url)
     github = FakeGitHub(origin=origin, ci_state="pass")
@@ -40,6 +41,6 @@ def test_full_workflow_happy_path(tmp_path: Path, monkeypatch):
     ctx.repo.save_incremental(job)
     final = run_to_completion(ctx, job, max_steps=40)
     assert final.pull_request_url, f"expected PR, got state={final.current_state} errors={final.errors}"
-    assert final.current_state.value in ("done", "wait_for_review")
+    assert final.current_state.value in ("done", "wait_for_review", "pr_open", "merge_ready")
     assert github.created_prs, "PR should have been created"
     assert final.test_results and final.test_results[-1].passed

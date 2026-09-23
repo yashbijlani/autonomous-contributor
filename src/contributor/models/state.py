@@ -47,6 +47,25 @@ class JobStatus(str, Enum):
     PUSH_FAILED = "push_failed"
     # Final deterministic gate refused to push (not a code failure).
     PUSH_GATE_REJECTED = "push_gate_rejected"
+    # The pushed branch could not be verified on the remote (never open a PR).
+    PUSH_UNVERIFIED = "push_unverified"
+    # PR lifecycle (only entered in live PR mode; PR exists only if the API
+    # actually returned one).
+    PR_CREATE_PENDING = "pr_create_pending"
+    PR_OPEN = "pr_open"
+    PR_CREATE_FAILED = "pr_create_failed"
+    # CI lifecycle (check states come from GitHub, never from the model).
+    CI_PENDING = "ci_pending"
+    CI_RUNNING = "ci_running"
+    CI_PASSED = "ci_passed"
+    CI_FAILED = "ci_failed"
+    CI_UNKNOWN = "ci_unknown"
+    CI_REPAIRING = "ci_repairing"
+    CI_REPAIRED = "ci_repaired"
+    CI_REPAIR_EXHAUSTED = "ci_repair_exhausted"
+    # CI passed (or no required checks) and the PR is ready for human merge.
+    # The system NEVER merges automatically.
+    MERGE_READY = "merge_ready"
 
 
 class TriageDecision(str, Enum):
@@ -66,9 +85,30 @@ class EnvironmentStrategy(str, Enum):
 
 class CIFailureClass(str, Enum):
     CODE_FAILURE = "code_failure"
+    TEST_FAILURE = "test_failure"
+    BUILD_FAILURE = "build_failure"
+    DEPENDENCY_FAILURE = "dependency_failure"
     ENVIRONMENT_FAILURE = "environment_failure"
+    RESOURCE_FAILURE = "resource_failure"
     CI_INFRASTRUCTURE_FAILURE = "ci_infrastructure_failure"
+    NETWORK_FAILURE = "network_failure"
+    FLAKY_FAILURE = "flaky_failure"
+    PERMISSION_FAILURE = "permission_failure"
     UNKNOWN = "unknown"
+
+    @property
+    def repairable(self) -> bool:
+        """Only failures plausibly caused by the contribution may be repaired.
+
+        Infrastructure/environment/flaky failures must never send the coding
+        agent chasing a problem it cannot fix.
+        """
+        return self in {
+            CIFailureClass.CODE_FAILURE,
+            CIFailureClass.TEST_FAILURE,
+            CIFailureClass.BUILD_FAILURE,
+            CIFailureClass.UNKNOWN,
+        }
 
 
 class EnvironmentReport(BaseModel):
@@ -201,9 +241,28 @@ class ReviewResult(BaseModel):
 
 
 class CIResult(BaseModel):
+    """Normalized CI outcome. `state` is the aggregate verdict used for routing.
+
+    `checks` holds normalized check dicts:
+    {name, workflow, status, conclusion, url, started_at, completed_at,
+     duration_s, app, required, state}
+    `state` per check is one of pass|fail|pending (backward-compatible view).
+    """
+
     state: Literal["pass", "fail", "pending", "unknown"] = "unknown"
     checks: list[dict[str, Any]] = Field(default_factory=list)
     summary: str = ""
+    # Aggregate phase across checks: queued|in_progress|completed|"".
+    phase: str = ""
+    total: int = 0
+    required_total: int = 0
+    required_pending: int = 0
+    required_failed: int = 0
+    timed_out: bool = False
+    polls: int = 0
+    waited_s: float = 0.0
+    raw_ref: str = ""
+    diagnosis: dict[str, Any] = Field(default_factory=dict)
 
 
 class JobEvent(BaseModel):
@@ -253,11 +312,36 @@ class JobState(BaseModel):
     resource_profile: str = ""
     # Live contribution mode + orchestrator-owned push.
     execution_mode: str = "benchmark"  # benchmark | live
+    allow_push: bool = False
+    allow_create_pr: bool = False
+    ci_monitor: bool = False
     commit_sha: str = ""
     push_remote: str = ""
     push_target: str = ""
     push_gate: dict[str, Any] | None = None
     push_result: dict[str, Any] | None = None
+    # Remote ref verification (must succeed before a PR is created).
+    remote_ref_verified: bool = False
+    remote_ref_sha: str = ""
+    # PR lifecycle metadata.
+    pr_head_owner: str = ""
+    pr_head_branch: str = ""
+    pr_base_repo: str = ""
+    pr_base_branch: str = ""
+    pr_title: str = ""
+    pr_reused: bool = False
+    pr_template_used: bool = False
+    # CI monitoring results.
+    ci_checks: list[dict[str, Any]] = Field(default_factory=list)
+    ci_diagnosis: dict[str, Any] | None = None
+    ci_raw_ref: str = ""
+    ci_wait_s: float = 0.0
+    ci_polls: int = 0
+    ci_retry_count: int = 0
+    # Audit trail of repair commits (parent/new sha, reason, tests, review).
+    repair_history: list[dict[str, Any]] = Field(default_factory=list)
+    merge_ready: bool = False
+    auto_merge: bool = False
 
     def touch(self) -> None:
         self.updated_at = utcnow_iso()

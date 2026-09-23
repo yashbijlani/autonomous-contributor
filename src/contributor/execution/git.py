@@ -110,6 +110,51 @@ def head_sha(workspace: Path) -> str:
     return r.stdout.strip() if r.ok else ""
 
 
+def branch_exists(workspace: Path, branch: str) -> bool:
+    r = run_command(
+        ["git", "-C", str(workspace), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        timeout=15,
+    )
+    return r.ok and bool(r.stdout.strip())
+
+
+def checkout_branch(workspace: Path, branch: str) -> CommandResult:
+    if branch in PROTECTED:
+        raise ValueError(f"Refusing to use protected branch name: {branch}")
+    return run_command(["git", "-C", str(workspace), "checkout", branch], timeout=60)
+
+
+def remote_ref_sha(url: str, branch: str, *, timeout: int = 60) -> str:
+    """Return the remote SHA for refs/heads/<branch>, or "" when absent."""
+    r = run_command(
+        ["git", "ls-remote", url, f"refs/heads/{branch}"], timeout=timeout
+    )
+    if not r.ok:
+        return ""
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].endswith(f"refs/heads/{branch}"):
+            return parts[0].strip()
+    return ""
+
+
+def verify_pushed_ref(url: str, branch: str, expected_sha: str, *, timeout: int = 60) -> CommandResult:
+    """Confirm the pushed branch exists remotely at the expected commit.
+
+    A PR is never created unless this succeeds. Credentials are redacted from
+    the recorded command.
+    """
+    sha = remote_ref_sha(url, branch, timeout=timeout)
+    label = f"git ls-remote <redacted-target> refs/heads/{branch}"
+    if not sha:
+        return CommandResult(label, 1, "", f"remote ref refs/heads/{branch} not found", 0.0)
+    if expected_sha and sha != expected_sha:
+        return CommandResult(
+            label, 1, sha, f"remote {sha} != pushed {expected_sha}", 0.0
+        )
+    return CommandResult(label, 0, sha, "", 0.0)
+
+
 def log_last(workspace: Path, n: int = 1) -> str:
     r = run_command(["git", "-C", str(workspace), "log", "--oneline", "-n", str(n)], timeout=15)
     return r.stdout.strip() if r.ok else ""
