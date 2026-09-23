@@ -76,3 +76,31 @@ def test_go_package_targets(tmp_path):
     cmds = targeted_commands(ws, ["internal/resolver/resolver.go"], ecosystem="go")
     assert cmds == ["go test ./internal/resolver/..."]
     assert is_command_allowed(cmds[0])
+
+
+def test_shell_changed_test_file_is_targeted(tmp_path):
+    ws = _mk(tmp_path)
+    shell_dir = ws / "test" / "shell.d"
+    shell_dir.mkdir(parents=True)
+    test_file = shell_dir / "menu-file-symlink-test.sh"
+    test_file.write_text("#!/bin/bash\necho ok\n")
+    cmds = targeted_commands(
+        ws, ["bin/omarchy-menu-file", "test/shell.d/menu-file-symlink-test.sh"], ecosystem="shell"
+    )
+    assert cmds == ["bash test/shell.d/menu-file-symlink-test.sh"]
+    assert is_command_allowed(cmds[0])
+
+
+def test_shell_source_maps_to_conventional_test(tmp_path):
+    ws = _mk(tmp_path)
+    shell_dir = ws / "test" / "shell.d"
+    shell_dir.mkdir(parents=True)
+    (shell_dir / "menu-file-test.sh").write_text("#!/bin/bash\necho ok\n")
+    cmds = targeted_commands(ws, ["bin/omarchy-menu-file"], ecosystem="shell")
+    assert cmds == ["bash test/shell.d/menu-file-test.sh"]
+    assert is_command_allowed(cmds[0])
+
+
+def test_shell_no_targets_without_test(tmp_path):
+    ws = _mk(tmp_path)
+    assert targeted_commands(ws, ["bin/omarchy-menu-file"], ecosystem="shell") == []

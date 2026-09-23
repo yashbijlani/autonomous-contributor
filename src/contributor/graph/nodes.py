@@ -503,17 +503,17 @@ def node_test(state: dict, ctx: WorkflowContext) -> dict:
         session = ctx.sessions.get(st.job_id) if ctx.sessions is not None else None
         runner = TestRunner(ctx.sandbox, test_timeout_s=ctx.settings.test_timeout_s, session=session)
         tr = None
-        if ctx.benchmark_mode:
-            # Benchmark: smallest meaningful test set first (changed/related
-            # tests). Fall back to the repo's canonical suite when no targeted
-            # command can be derived.
-            from contributor.execution.git import working_tree_files
+        # Prefer the smallest meaningful test set (changed/related tests) in every
+        # mode; fall back to the repo's canonical suite when no targeted command
+        # can be derived. This keeps live contributions from blindly running the
+        # entire repository suite (resource + time safety).
+        from contributor.execution.git import working_tree_files
 
-            changed = working_tree_files(ws)
-            likely = st.plan.files_expected_to_change if st.plan else []
-            tr = runner.run_targeted(ws, changed_files=changed, likely_files=likely)
-            if tr is not None:
-                st.issue_metadata["targeted_test_command"] = tr.command
+        changed = working_tree_files(ws)
+        likely = st.plan.files_expected_to_change if st.plan else []
+        tr = runner.run_targeted(ws, changed_files=changed, likely_files=likely)
+        if tr is not None:
+            st.issue_metadata["targeted_test_command"] = tr.command
         if tr is None:
             tr = runner.run(ws, suggested=suggested)
         st.test_results.append(tr)

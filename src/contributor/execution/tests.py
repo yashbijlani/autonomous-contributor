@@ -209,6 +209,48 @@ def _go_package_targets(changed_files: list[str], likely_files: list[str] | None
     return dirs
 
 
+def _shell_test_targets(
+    workspace: Path,
+    changed_files: list[str],
+    likely_files: list[str] | None,
+    *,
+    limit: int = 8,
+) -> list[str]:
+    """Narrowest shell test set for a change.
+
+    Prefers shell test files that were changed/added. When only a source script
+    changed (the agent may not have added a test yet), maps the changed
+    ``bin/<name>`` script to its conventional ``test/shell.d/*<name>*-test.sh``.
+    """
+    targets: list[str] = []
+
+    def add(rel: str) -> None:
+        rel = rel.strip().lstrip("./")
+        if rel and rel not in targets and (workspace / rel).is_file():
+            targets.append(rel)
+
+    for f in list(changed_files) + list(likely_files or []):
+        f = f.strip().lstrip("./")
+        if f.startswith("test/") and f.endswith((".sh", ".bats")):
+            add(f)
+    if targets:
+        return targets[:limit]
+
+    shell_dir = workspace / "test" / "shell.d"
+    for f in changed_files:
+        f = f.strip().lstrip("./")
+        if not f.startswith("bin/"):
+            continue
+        stem = Path(f).name
+        tokens = {stem, stem.removeprefix("omarchy-")}
+        for token in sorted(t for t in tokens if t):
+            for match in sorted(shell_dir.glob(f"*{token}*-test.sh")):
+                add(str(match.relative_to(workspace)))
+        if targets:
+            break
+    return targets[:limit]
+
+
 def python_runner_prefix(workspace: Path) -> str:
     """Return the project runner prefix for Python tests (project venv aware)."""
     if (workspace / "uv.lock").exists():
@@ -247,6 +289,11 @@ def targeted_commands(
         if dirs:
             pkgs = " ".join(f"./{d}/..." if d != "." else "./..." for d in dirs)
             return [f"go test {pkgs}"]
+    elif eco == "shell":
+        targets = _shell_test_targets(workspace, changed_files, likely_files)
+        if targets:
+            joined = " ".join(shlex.quote(t) for t in targets)
+            return [f"bash {joined}"]
     return []
 
 
